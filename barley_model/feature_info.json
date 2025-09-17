@@ -1,0 +1,26 @@
+{
+  "feature_cols": [
+    "source_doc",
+    "year",
+    "site_id",
+    "end_use",
+    "n_rate_kg_ha",
+    "n_split_first_prop",
+    "final_n_timing_gs"
+  ],
+  "num_cols": [
+    "year",
+    "n_rate_kg_ha",
+    "n_split_first_prop"
+  ],
+  "cat_cols": [
+    "source_doc",
+    "site_id",
+    "end_use",
+    "final_n_timing_gs"
+  ],
+  "targets": [
+    "grain_protein_pct",
+    "yield_t_ha"
+  ]
+}
