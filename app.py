@@ -67,6 +67,7 @@ class Inputs:
     p_rate: float
     moisture_pct: float
     field_size: float
+    barley_type: str         # "Malting" or "Feed"
     barley_price: float
     urea_price: float
     phosphate_price: float
@@ -81,14 +82,17 @@ def symbol(cur: str) -> str: return CURRENCY_SYMBOLS.get(cur, cur)
 
 def load_model():
     if os.path.exists(MODEL_PATH):
-        try: return joblib.load(MODEL_PATH)
-        except Exception: pass
+        try:
+            return joblib.load(MODEL_PATH)
+        except Exception:
+            pass
+    # Fallback keeps app usable
     class FallbackModel:
         def predict(self, X: pd.DataFrame) -> np.ndarray:
             n = X["n_rate"].values
-            yld = 6.5 + 0.035*n - 0.00007*(n**2)
+            yld = 6.5 + 0.035*n - 0.00007*(n**2)              # t/ha, diminishing returns
             yld = np.clip(yld, 3.5, 12.0)
-            prot_as_is = np.clip(7.5 + 0.010*n, 7.0, 12.0)
+            prot_as_is = np.clip(7.5 + 0.010*n, 7.0, 12.0)    # % as-is
             return np.c_[yld, prot_as_is]
     return FallbackModel()
 
@@ -110,6 +114,7 @@ def estimate_starch_dm(protein_dm_pct: float, protector_on: bool) -> Tuple[float
 
 def gross_margin_simple(inp: Inputs, yield_t_ha: float):
     cur = symbol(inp.currency)
+    # Urea: 46% N
     kg_urea_per_ha = inp.n_rate / 0.46
     t_urea_per_ha = kg_urea_per_ha / 1000.0
     urea_cost = t_urea_per_ha * inp.urea_price
@@ -125,7 +130,7 @@ def gross_margin_simple(inp: Inputs, yield_t_ha: float):
     margin_total = margin_per_ha * inp.field_size
 
     rows = [
-        ("Revenue", f"{cur}{revenue:,.0f} /ha", ""),
+        (f"Revenue ({inp.barley_type})", f"{cur}{revenue:,.0f} /ha", f"Price: {cur}{inp.barley_price}/t"),
         ("Urea cost", f"{cur}{urea_cost:,.0f} /ha", f"{kg_urea_per_ha:,.0f} kg urea/ha"),
         ("Nitrogen inhibitor" + (" (ON)" if inp.inhibitor_on else " (OFF)"),
          f"{cur}{inhibitor_cost:,.0f} /ha",
@@ -149,9 +154,19 @@ with st.sidebar:
     c1, c2 = st.columns(2)
     with c1:
         n_rate = st.number_input("Nitrogen rate (kg N/ha)", 0.0, 400.0, 160.0, 5.0)
-        barley_price = st.number_input(f"Barley price (malting) [{cur}/t]", 50.0, 1000.0, 320.0, 5.0)
-        moisture_pct = st.number_input("Grain moisture at measurement (%)", 8.0, 28.0, 12.0, 0.5,
-                                       help="Used to convert model protein (as-is) to Dry Matter (DM).")
+        # Barley type selector + context-aware price label
+        barley_type = st.radio("Barley type", options=["Malting", "Feed"], index=0,
+                               help="Switches the reference price between malting and feed.")
+        default_malting = 320.0
+        default_feed = 260.0
+        price_label = "Malting barley price" if barley_type == "Malting" else "Feed barley price"
+        default_price = default_malting if barley_type == "Malting" else default_feed
+        barley_price = st.number_input(f"{price_label} [{cur}/t]", 50.0, 1000.0, default_price, 5.0)
+
+        moisture_pct = st.number_input(
+            "Grain moisture at measurement (%)", 8.0, 28.0, 12.0, 0.5,
+            help="Used to convert model protein (as-is) to Dry Matter (DM)."
+        )
     with c2:
         p_rate = st.number_input("Phosphate rate (kg P₂O₅/ha)", 0.0, 200.0, 60.0, 5.0)
         urea_price = st.number_input(f"Urea price [{cur}/t]", 100.0, 1500.0, 450.0, 10.0)
@@ -162,7 +177,7 @@ with st.sidebar:
     inhibitor_on = st.toggle("Use nitrogen inhibitor", value=False, help=f"Adds cost per tonne of urea. Default {cur}35/t.")
     inhibitor_cost = st.number_input(f"Inhibitor cost [{cur}/t urea]", 0.0, 200.0, 35.0, 1.0, disabled=not inhibitor_on)
 
-    protector_on = st.toggle("Use phosphate protector", value=False, help=f"Adds cost per tonne of phosphate and nudges starch DM.")
+    protector_on = st.toggle("Use phosphate protector", value=False, help=f"Adds cost per tonne of phosphate and may nudge starch DM.")
     protector_cost = st.number_input(f"Protector cost [{cur}/t phosphate]", 0.0, 200.0, 45.0, 1.0, disabled=not protector_on)
 
     st.divider()
@@ -170,7 +185,8 @@ with st.sidebar:
 
     inputs = Inputs(
         n_rate=n_rate, p_rate=p_rate, moisture_pct=moisture_pct, field_size=field_size,
-        barley_price=barley_price, urea_price=urea_price, phosphate_price=phosphate_price,
+        barley_type=barley_type, barley_price=barley_price,
+        urea_price=urea_price, phosphate_price=phosphate_price,
         inhibitor_on=inhibitor_on, inhibitor_cost_per_t_urea=inhibitor_cost,
         protector_on=protector_on, protector_cost_per_t_phosphate=protector_cost,
         currency=currency,
@@ -185,14 +201,11 @@ starch_low, starch_high = estimate_starch_dm(protein_dm, inputs.protector_on)
 # ================== Compact KPI row ==================
 st.markdown('<div class="kpi-grid">', unsafe_allow_html=True)
 
-# Predicted yield
 st.markdown(
     '<div class="kpi"><h4>Predicted yield</h4>'
     f'<div class="val good">{yield_t_ha:.2f} t/ha</div></div>',
     unsafe_allow_html=True
 )
-
-# Predicted protein (DM) WITH NOTE INSIDE CARD
 st.markdown(
     '<div class="kpi"><h4>Predicted grain protein (DM)</h4>'
     f'<div class="val">{protein_dm:.2f} %</div>'
@@ -200,23 +213,19 @@ st.markdown(
     '</div>',
     unsafe_allow_html=True
 )
-
-# Estimated starch (DM)
 st.markdown(
     '<div class="kpi"><h4>Estimated starch (DM)</h4>'
     f'<div class="val">{starch_low:.1f}–{starch_high:.1f}%</div></div>',
     unsafe_allow_html=True
 )
 
-# Gross margin per ha
 margin_per_ha, margin_total, _tmp = gross_margin_simple(inputs, yield_t_ha)
 st.markdown(
     '<div class="kpi"><h4>Gross margin (per ha)</h4>'
     f'<div class="val">{symbol(inputs.currency)}{margin_per_ha:,.0f}</div></div>',
     unsafe_allow_html=True
 )
-
-st.markdown('</div>', unsafe_allow_html=True)  # end kpi-grid
+st.markdown('</div>', unsafe_allow_html=True)
 
 # ================== Quality & Economics Sections ==================
 c1, c2 = st.columns((1.1, 1.0), gap="large")
@@ -297,6 +306,7 @@ if user_msg:
         "protein_dm_pct": round(protein_dm, 2),
         "starch_dm_band": (round(starch_low, 1), round(starch_high, 1)),
         "currency": inputs.currency,
+        "barley_type": inputs.barley_type,
         "barley_price_per_t": inputs.barley_price,
         "urea_price_per_t": inputs.urea_price,
         "phosphate_price_per_t": inputs.phosphate_price,
