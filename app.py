@@ -85,7 +85,52 @@ GS_OPTIONS = {
 }
 GS_LABELS = list(GS_OPTIONS.keys())
 
-# ============= Helpers =============
+# ============= Helpers (NEW: proxy quality estimators) =============
+def clamp(val: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, val))
+
+def estimate_protein_percent(
+    n_rate_kg_ha: float,
+    use_n_inhibitor: bool,
+    use_p_protector: bool,
+    baseline_protein: float = 10.5,
+    n_ref_kg_ha: float = 120.0,
+    n_to_protein_slope: float = 0.005,  # % protein per kg N deviation from ref
+) -> float:
+    """
+    Demo estimator:
+    - Start at 10.5% protein at ~120 kg N/ha.
+    - Protein rises ~0.005% per kg N above ref; falls below ref.
+    - N inhibitor increases effective N availability by ~10% (demo assumption).
+    - P protector slightly increases carbohydrate deposition → mild protein dilution: -0.2% abs.
+    """
+    effective_n = n_rate_kg_ha * (1.10 if use_n_inhibitor else 1.00)
+    delta_n = effective_n - n_ref_kg_ha
+    protein = baseline_protein + n_to_protein_slope * delta_n
+    if use_p_protector:
+        protein -= 0.2
+    return clamp(protein, 8.5, 14.5)
+
+def estimate_starch_percent(
+    protein_percent: float,
+    use_p_protector: bool
+) -> float:
+    """
+    Demo starch estimator as a derived trait:
+    Starch% = 64 – 0.7 * (Protein% – 10) + 0.3 * P_index
+    where P_index = 2 if P protector ON, else 1 (baseline P status).
+    """
+    p_index = 2 if use_p_protector else 1
+    starch = 64.0 - 0.7 * (protein_percent - 10.0) + 0.3 * p_index
+    return clamp(starch, 55.0, 68.0)
+
+def as_range(center: float, spread: float = 0.8) -> str:
+    """Return a friendly ± range string, e.g., '61.2–62.8%'."""
+    lo = round(center - spread, 1)
+    hi = round(center + spread, 1)
+    return f"{lo}–{hi}%"
+
+# ============= Core prediction =============
 def predict_yield_protein(
     end_use: str,
     n_rate_kg_ha: float,
@@ -193,6 +238,22 @@ with st.container():
 
     final_n_timing = st.selectbox("Final N timing", GS_LABELS, index=0)
 
+    # NEW: quality/management toggles
+    st.markdown("#### Quality levers")
+    q1, q2 = st.columns(2)
+    with q1:
+        use_n_inhibitor = st.toggle(
+            "Use nitrogen inhibitor? (+$35 per tonne of urea)",
+            value=False,
+            help="Demo assumption: inhibitor improves effective N availability by ~10% and adds $35/t urea cost."
+        )
+    with q2:
+        use_p_protector = st.toggle(
+            "Use phosphate protector?",
+            value=False,
+            help="Demo: improves carbohydrate metabolism slightly → higher starch, mild protein dilution. No cost modeled yet."
+        )
+
 # Optional: small developer drawer (hidden values)
 with st.sidebar:
     st.markdown("### ⚙️ Developer settings")
@@ -221,8 +282,28 @@ if pred_error:
     st.error(pred_error)
 
 if pred_yield is not None and pred_protein is not None and pred_error is None:
-    st.success(f"**Predicted yield:** {pred_yield:0.2f} t/ha")
-    st.success(f"**Predicted grain protein:** {pred_protein:0.2f} %")
+    st.success(f"**Predicted yield (model):** {pred_yield:0.2f} t/ha")
+    st.success(f"**Predicted grain protein (model):** {pred_protein:0.2f} %")
+
+    # ===== NEW: Estimated Protein & Starch (proxy) =====
+    est_protein = estimate_protein_percent(
+        n_rate_kg_ha=n_rate,
+        use_n_inhibitor=use_n_inhibitor,
+        use_p_protector=use_p_protector
+    )
+    est_starch = estimate_starch_percent(
+        protein_percent=est_protein,
+        use_p_protector=use_p_protector
+    )
+    protein_range = as_range(est_protein, 0.5)  # ±0.5% band
+    starch_range  = as_range(est_starch, 0.8)   # ±0.8% band
+
+    st.markdown("### Estimated quality (proxy)")
+    qp, qs = st.columns(2)
+    with qp:
+        kpi_card("Estimated Protein (DM)", protein_range, "#0ea5e9")
+    with qs:
+        kpi_card("Estimated Starch (DM)", starch_range, "#0ea5e9")
 
 # ============= Simple gross margin =============
 st.markdown("### Gross margin (simple)")
@@ -276,7 +357,17 @@ if pred_yield is not None and pred_error is None:
         urea_needed_kg = n_rate / 0.46
         n_cost_ha = (urea_needed_kg / 1000.0) * urea_price
     else:
+        urea_needed_kg = 0.0
         n_cost_ha = 0.0
+
+    # NEW: inhibitor cost (+$35 per tonne of urea applied) if enabled
+    inhibitor_cost_per_t_urea = 35.0
+    inhibitor_cost_ha = 0.0
+    if urea_needed_kg > 0 and use_n_inhibitor:
+        inhibitor_cost_ha = (urea_needed_kg / 1000.0) * inhibitor_cost_per_t_urea
+        n_cost_ha += inhibitor_cost_ha
+
+    # TODO (optional): If you later model P fertilizer tonnage, add P protector $/t cost here.
 
     gross_margin_ha = revenue_ha - n_cost_ha
 
@@ -289,6 +380,9 @@ if pred_yield is not None and pred_error is None:
     with c3:
         gm_color = "#16a34a" if gross_margin_ha >= 0 else "#dc2626"
         kpi_card("Gross margin/ha", fmt_money(gross_margin_ha, cur), gm_color)
+
+    if use_n_inhibitor and inhibitor_cost_ha > 0:
+        st.caption(f"Includes inhibitor cost: ~{fmt_money(inhibitor_cost_ha, cur)} per ha (at ${inhibitor_cost_per_t_urea:.0f}/t urea).")
 else:
     st.info("Enter inputs and click **Predict** to see the gross margin KPIs.")
 
@@ -314,8 +408,6 @@ user_q = st.text_input(
     label_visibility="collapsed",
     key="ask_box"
 )
-
-
 
 def azure_chat_completion(
     prompt: str,
@@ -377,10 +469,16 @@ if user_q:
         "N rate (kg/ha)": f"{n_rate}",
         "N split first prop": f"{n_split_first}",
         "Final N timing": final_n_timing,
+        "N inhibitor": "on" if 'use_n_inhibitor' in locals() and use_n_inhibitor else "off",
+        "P protector": "on" if 'use_p_protector' in locals() and use_p_protector else "off",
     }
     if pred_yield is not None and pred_error is None:
         ctx["Predicted yield (t/ha)"] = f"{pred_yield:0.2f}"
-        ctx["Predicted protein (%)"] = f"{pred_protein:0.2f}"
+        ctx["Predicted protein (%) [model]"] = f"{pred_protein:0.2f}"
+    # Include proxy est. if available
+    if 'protein_range' in locals() and 'starch_range' in locals():
+        ctx["Estimated protein (DM) [proxy]"] = protein_range
+        ctx["Estimated starch (DM) [proxy]"] = starch_range
     if 'barley_price' in locals():
         ctx["Barley price (USD/t)"] = f"{barley_price:0.0f}"
     if 'urea_price' in locals():
@@ -405,6 +503,3 @@ with col2:
         "<img src='https://cdn-icons-png.flaticon.com/512/174/174857.png' width='15'>",
         unsafe_allow_html=True
     )
-
-
-
