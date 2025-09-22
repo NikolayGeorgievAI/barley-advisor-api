@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Tuple, Dict
+from typing import Tuple
 
 import numpy as np
 import pandas as pd
@@ -18,13 +18,9 @@ st.markdown(
     """
     <style>
       .block-container {padding-top: 0.6rem; padding-bottom: 1.2rem; max-width: 1200px;}
-
-      .top-banner {
-        display:flex; justify-content:space-between; align-items:center;
-        font-size:13px; padding:4px 8px; border-radius:10px;
-        background:#f5f7fb; border:1px solid #e7ebf5; margin-bottom:6px;
-        white-space:nowrap; gap:8px;
-      }
+      .top-banner {display:flex; justify-content:space-between; align-items:center;
+        font-size:13px; padding:4px 8px; border-radius:10px; background:#f5f7fb;
+        border:1px solid #e7ebf5; margin-bottom:6px; white-space:nowrap; gap:8px;}
       .pill {display:inline-block; padding:2px 8px; border-radius:999px; background:#eef6ff; border:1px solid #dbeafe; font-size:12px;}
 
       .kpi-grid {display:grid; grid-template-columns: repeat(4, minmax(210px, 1fr)); gap:10px;}
@@ -33,6 +29,7 @@ st.markdown(
       .kpi .val {font-size:22px; font-weight:800; letter-spacing:-0.2px;}
       .muted {color:#667085; font-size:12px;}
       .good {color:#117a37;}
+
       .card {border:1px solid #eef1f6; border-radius:14px; padding:14px; background:white;}
     </style>
     """,
@@ -72,7 +69,7 @@ CURRENCY_SYMBOLS = {"EUR": "€", "USD": "$", "CHF": "CHF"}
 def symbol(cur: str) -> str: return CURRENCY_SYMBOLS.get(cur, cur)
 
 def load_model():
-    """Load your trained model. Fallback keeps the app usable."""
+    """Load your trained model [yield_t_ha, protein_as_is_pct]. Fallback keeps the app usable."""
     if os.path.exists(MODEL_PATH):
         try:
             return joblib.load(MODEL_PATH)
@@ -95,16 +92,22 @@ def predict_yield_and_protein_as_is(n_rate: float, p_rate: float) -> Tuple[float
     return float(yld), float(prot)
 
 def as_is_to_dm(protein_as_is_pct: float, moisture_pct: float) -> float:
+    """Convert protein measured on wet (as-is) basis to dry matter basis."""
     m = max(0.0, min(40.0, moisture_pct)) / 100.0
     return protein_as_is_pct / (1.0 - m)
 
 def estimate_starch_dm(protein_dm_pct: float, protector_on: bool) -> Tuple[float, float]:
+    """
+    Simple proxy: starch inversely tracks protein. Base 64% starch DM at 10% protein DM.
+    Protector ON nudges starch up by +0.6 abs. Returns a band ±0.8 abs.
+    """
     base = 64.0 - 0.7*(protein_dm_pct - 10.0)
     if protector_on: base += 0.6
     return max(55.0, min(72.0, base - 0.8)), max(55.0, min(72.0, base + 0.8))
 
 def gross_margin_simple(inp: Inputs, yield_t_ha: float):
     cur = symbol(inp.currency)
+    # Urea: 46% N
     kg_urea_per_ha = inp.n_rate / 0.46
     t_urea_per_ha = kg_urea_per_ha / 1000.0
     urea_cost = t_urea_per_ha * inp.urea_price
@@ -222,15 +225,19 @@ with c2:
         unsafe_allow_html=True
     )
 
-# ================== Azure GenAI (with diagnostics) ==================
+# ================== Azure GenAI (no diagnostics UI) ==================
 st.subheader("Ask the Generative AI advisor")
 st.caption("Powered by Azure OpenAI when configured. Try: “What if I reduce N by 15%?”")
 
 def get_secret_or_env(name: str, default: str = "") -> str:
-    # Prefer Streamlit secrets, then env var
+    # Prefer Streamlit secrets (flat or [azure] nested), then env vars
     try:
-        if name in st.secrets:
-            return str(st.secrets[name])
+        if name in st.secrets:  # flat
+            v = str(st.secrets[name]).strip()
+            if v: return v
+        if "azure" in st.secrets and name.lower().replace("azure_openai_", "").replace("api_", "api_") in st.secrets["azure"]:
+            v = str(st.secrets["azure"][name.lower().replace("azure_openai_", "")]).strip()
+            if v: return v
     except Exception:
         pass
     return os.getenv(name, default)
@@ -240,32 +247,14 @@ AZURE_DEPLOYMENT = get_secret_or_env("AZURE_OPENAI_DEPLOYMENT")
 AZURE_API_KEY    = get_secret_or_env("AZURE_OPENAI_API_KEY")
 AZURE_API_VERSION= get_secret_or_env("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
 
-def azure_config_status() -> Dict[str, bool]:
-    return {
-        "AZURE_OPENAI_ENDPOINT": bool(AZURE_ENDPOINT),
-        "AZURE_OPENAI_DEPLOYMENT": bool(AZURE_DEPLOYMENT),
-        "AZURE_OPENAI_API_KEY": bool(AZURE_API_KEY),
-        "AZURE_OPENAI_API_VERSION": bool(AZURE_API_VERSION),
-    }
-
-with st.expander("Azure connection status", expanded=False):
-    status = azure_config_status()
-    cols = st.columns(4)
-    for i, (k, ok) in enumerate(status.items()):
-        with cols[i]:
-            st.write(("✅" if ok else "❌") + f" {k}")
-    st.caption("Tip (Streamlit Cloud): set these in **Settings → Secrets** as the exact keys above. The deployment is the *model deployment name* in Azure OpenAI (e.g., `gpt-4o-mini`).")
-
 def call_azure_genai(prompt: str, context: dict) -> str:
-    # If not configured, provide a safe heuristic fallback (no tildes to avoid Markdown strike).
     if not (AZURE_ENDPOINT and AZURE_DEPLOYMENT and AZURE_API_KEY):
         return ("Azure advisor not configured. Heuristic: lowering N ≈15% usually reduces protein (DM) by ≈0.1–0.3 percentage points; "
                 "yield response varies by season. Urea savings can improve margin when grain prices are soft. "
                 "Protector adds cost but may nudge starch DM upward (≈+0.6 pp here).")
-
     try:
         import requests
-        url = f"{AZURE_ENDPOINT}/openai/deployments/{AZURE_DEPLOYMENT}/chat/completions?api-version={AZURE_API_VERSION}"
+        url = f"{AZURE_ENDPOINT.rstrip('/')}/openai/deployments/{AZURE_DEPLOYMENT}/chat/completions?api-version={AZURE_API_VERSION}"
         headers = {"api-key": AZURE_API_KEY, "Content-Type": "application/json"}
         sys_prompt = (
             "You are an agronomy advisor. Be concise and practical. "
@@ -294,7 +283,6 @@ def sanitize_md(s: str) -> str:
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
-# Render prior messages
 for role, content in st.session_state.chat_history:
     with st.chat_message(role): st.markdown(content)
 
