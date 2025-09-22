@@ -1,3 +1,4 @@
+# app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -16,20 +17,27 @@ def load_model():
 
 model = load_model()
 
-# ---------------- Expected features ----------------
+# ---------------- Discover expected features ----------------
 EXPECTED = getattr(model, "feature_names_in_", None)
+
 if EXPECTED is None:
-    # Try to find feature_names_in_ on final estimator inside a pipeline
-    EXPECTED = []
+    # Try to find feature_names_in_ on a step inside a pipeline
     if hasattr(model, "named_steps"):
         for step in model.named_steps.values():
             cols = getattr(step, "feature_names_in_", None)
             if cols is not None:
-                EXPECTED = list(cols)
+                EXPECTED = cols
                 break
-if not EXPECTED:
-    st.error("Model does not expose expected input feature names. Refit on a pandas DataFrame or provide the column list.")
+
+# Safe emptiness check (works for list or numpy array)
+if EXPECTED is None or len(EXPECTED) == 0:
+    st.error(
+        "Model does not expose expected input feature names. "
+        "Refit on a pandas DataFrame or provide the column list."
+    )
     st.stop()
+
+# Ensure plain Python list
 EXPECTED = list(EXPECTED)
 
 # ---------------- Introspect categories from encoders ----------------
@@ -40,10 +48,16 @@ def discover_categorical_options(m) -> Dict[str, List[Any]]:
     """
     options: Dict[str, List[Any]] = {}
 
-    # Pull out a ColumnTransformer if present
+    def to_list(x):
+        if isinstance(x, (list, tuple)):
+            return list(x)
+        if isinstance(x, np.ndarray):
+            return x.tolist()
+        return [x]
+
     transformers = []
+    # Pull out a ColumnTransformer if present
     if hasattr(m, "named_steps"):
-        # Try to find a ColumnTransformer in named_steps
         for step in m.named_steps.values():
             if hasattr(step, "transformers_"):
                 transformers = step.transformers_
@@ -52,67 +66,65 @@ def discover_categorical_options(m) -> Dict[str, List[Any]]:
         transformers = m.transformers_
 
     # Each entry like ('cat', OneHotEncoder(...), [col1, col2, ...])
-    for name, transformer, cols in transformers:
-        # passthrough/ drop continue
+    for _, transformer, cols in transformers:
         if transformer in ("drop", "passthrough") or transformer is None:
             continue
 
-        # If there is an inner pipeline, dive into its final step
+        # If inner pipeline, take last step
+        inner = transformer
         if hasattr(transformer, "named_steps"):
             inner = list(transformer.named_steps.values())[-1]
-        else:
-            inner = transformer
 
-        # OneHotEncoder stores categories_ aligned to its input columns
         if inner.__class__.__name__ == "OneHotEncoder" and hasattr(inner, "categories_"):
             cats = inner.categories_
-            # cols might be list or array of feature names for this encoder
-            if isinstance(cols, (list, tuple, np.ndarray)) and len(cols) == len(cats):
-                for feat, cat_list in zip(cols, cats):
-                    # convert numpy arrays to python lists
-                    options[str(feat)] = [c.item() if hasattr(c, "item") else c for c in list(cat_list)]
+            cols_list = to_list(cols)
+            if len(cols_list) == len(cats):
+                for feat, cat_list in zip(cols_list, cats):
+                    clean = []
+                    for c in cat_list:
+                        # convert numpy scalars to python types
+                        if hasattr(c, "item"):
+                            clean.append(c.item())
+                        else:
+                            clean.append(c)
+                    options[str(feat)] = clean
 
     return options
 
 CATEGORICAL_OPTIONS = discover_categorical_options(model)
 
 # ---------------- Heuristics for numeric vs categorical ----------------
-NUMERIC_HINTS = ("_mm", "_c", "_kg", "_doy", "year", "prop", "gs", "srad", "rate")
+NUMERIC_HINTS = ("_mm", "_c", "_kg", "_kg_ha", "_doy", "year", "prop", "gs", "srad", "rate")
+
 def looks_numeric(name: str) -> bool:
     n = name.lower()
     return any(h in n for h in NUMERIC_HINTS)
 
-# ---------------- Build the input form ----------------
-st.subheader("Inputs")
-
-user_vals = {}
-cols = st.columns(2)
-
 def numeric_default_for(feat: str) -> float:
     f = feat.lower()
-    if "year" in f: return 2020
-    if f.endswith("_kg") or "kg_ha" in f or "rate" in f: return 120.0
+    if "year" in f: return 2020.0
+    if "kg_ha" in f or f.endswith("_kg") or "rate" in f: return 120.0
     if f.endswith("_mm"): return 120.0
     if f.endswith("_doy"): return 120.0
-    if f.endswith("_c") and "tmax" in f: return 18.0
-    if f.endswith("_c") and "tmin" in f: return 5.0
+    if "tmax" in f and f.endswith("_c"): return 18.0
+    if "tmin" in f and f.endswith("_c"): return 5.0
     if "srad" in f: return 500.0
     if f.endswith("prop"): return 0.5
     if f.endswith("gs"): return 30.0
     return 0.0
 
+# ---------------- Build the input form ----------------
+st.subheader("Inputs")
+
+user_vals: Dict[str, Any] = {}
+cols = st.columns(2)
+
 for i, feat in enumerate(EXPECTED):
     col = cols[i % 2]
     label = feat.replace("_", " ").title()
 
-    if feat in CATEGORICAL_OPTIONS:
-        # Use real categories learned during training
-        opts = CATEGORICAL_OPTIONS[feat]
-        # Streamlit requires non-empty options; if empty fallback to text
-        if opts:
-            user_vals[feat] = col.selectbox(label, options=opts, index=0)
-        else:
-            user_vals[feat] = col.text_input(label, "")
+    if feat in CATEGORICAL_OPTIONS and len(CATEGORICAL_OPTIONS[feat]) > 0:
+        user_vals[feat] = col.selectbox(label, options=CATEGORICAL_OPTIONS[feat])
     else:
         # Fallback: numeric vs text guess
         if looks_numeric(feat):
@@ -123,11 +135,11 @@ for i, feat in enumerate(EXPECTED):
 # ---------------- Predict ----------------
 if st.button("Predict"):
     try:
-        # Build a single row in the exact expected order
+        # Build single-row DataFrame in exact expected order
         row = []
         for feat in EXPECTED:
             v = user_vals.get(feat)
-            # Flatten arrays/lists (defensive)
+            # Flatten arrays/lists just in case
             if isinstance(v, (list, tuple, np.ndarray)):
                 v = v[0] if len(v) else None
             row.append(v)
@@ -135,15 +147,22 @@ if st.button("Predict"):
         X = pd.DataFrame([row], columns=EXPECTED)
 
         y = model.predict(X)
-        y = np.array(y).flatten()  # handle 1- or multi-target
+        y = np.array(y).flatten()  # single- or multi-target
 
         if len(y) == 1:
             st.success(f"Prediction: **{y[0]:.2f}**")
         else:
-            # You can rename these to your actual target names
+            # Rename these to your actual target names if you like
             st.success(f"🌾 Predicted yield: **{y[0]:.2f} t/ha**")
             st.success(f"🧬 Predicted grain protein: **{y[1]:.2f} %**")
 
     except Exception as e:
         st.error("Prediction failed.")
         st.code(repr(e))
+
+# ---------------- Optional debug toggle ----------------
+with st.expander("Debug (optional)"):
+    st.write("Expected feature order:", EXPECTED)
+    if CATEGORICAL_OPTIONS:
+        st.write("Categorical options discovered from model encoders:")
+        st.json(CATEGORICAL_OPTIONS)
