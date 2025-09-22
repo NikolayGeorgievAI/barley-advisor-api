@@ -95,13 +95,21 @@ else:
 # ---------- Predict ----------
 if st.button("Predict"):
     try:
-        # Build DataFrame in the exact expected order
+        def to_scalar(v):
+            import numpy as np
+            # unwrap numpy array / list
+            if isinstance(v, (list, tuple, np.ndarray)):
+                if len(v) > 0:
+                    return to_scalar(v[0])
+                else:
+                    return None
+            return v
+
         row = []
         for c in EXPECTED:
             v = user_vals.get(c)
-            # force scalar
-            if isinstance(v, (list, tuple, np.ndarray)):
-                v = v[0]
+            v = to_scalar(v)
+            # force float if numeric-looking
             try:
                 v = float(v)
             except Exception:
@@ -116,5 +124,7 @@ if st.button("Predict"):
     except Exception as e:
         st.error("Prediction failed — see details below.")
         st.code(repr(e))
+
+
 
 
