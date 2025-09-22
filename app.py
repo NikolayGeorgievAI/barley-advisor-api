@@ -218,11 +218,18 @@ with row_title:
 with row_settings:
     # Right-side compact settings box
     st.markdown('<div class="advisor-settings-col">', unsafe_allow_html=True)
-    with st.expander("Advisor settings (optional)", expanded=False):
-        temperature = st.slider("Creativity (temperature)", 0.0, 1.0, 0.2, 0.05,
-                                help="Lower is more conservative and grounded.")
-        # future: add region/crop context
-    st.markdown("</div>", unsafe_allow_html=True)
+  with st.expander("Advisor settings (optional)"):
+    creativity = st.slider(
+        "Response style",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.2,
+        step=0.05,
+        help="Controls how the advisor responds:\n"
+             "- Lower values = more conservative, consistent, and factual\n"
+             "- Higher values = more creative, exploratory, and varied"
+    )
+
 
 # Build a helpful, safe prompt
 def build_advisor_prompt(question: str) -> str:
@@ -324,3 +331,4 @@ st.markdown(
 """,
     unsafe_allow_html=True,
 )
+
