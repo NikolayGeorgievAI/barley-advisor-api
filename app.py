@@ -285,3 +285,18 @@ with left_col:
             st.warning("Azure call failed. " + (hint or "See error details below."))
             with st.expander("Error details"):
                 st.code(msg, language="text")
+# Footer
+st.markdown(
+    """
+    <hr style="margin-top: 2em; margin-bottom: 1em;">
+    <div style="text-align: center; color: grey; font-size: 0.9em;">
+        Developed by 
+        <a href="https://www.linkedin.com/in/nikolaygeorgiev/" target="_blank" style="color: grey; text-decoration: none;">
+            <img src="https://cdn-icons-png.flaticon.com/512/174/174857.png" width="16" style="vertical-align: middle; margin-right: 4px;">
+            <b>Nikolay Georgiev</b>
+        </a>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
