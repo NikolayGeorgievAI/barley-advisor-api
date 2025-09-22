@@ -309,10 +309,12 @@ with col_right:
 
 # Input line under the header
 user_q = st.text_input(
-    "Ask a question (e.g., 'What if I reduce N by 15%?')",
+    label="Ask the advisor",
+    placeholder="Ask a question (e.g., 'What if I reduce N by 15%?')",
     label_visibility="collapsed",
     key="ask_box"
 )
+
 
 
 def azure_chat_completion(
@@ -409,4 +411,5 @@ with footer_cols[-1]:
         """,
         unsafe_allow_html=True
     )
+
 
