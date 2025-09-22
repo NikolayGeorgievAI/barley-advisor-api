@@ -81,16 +81,16 @@ CURRENCY_SYMBOLS = {"EUR": "€", "USD": "$", "CHF": "CHF"}
 def symbol(cur: str) -> str: return CURRENCY_SYMBOLS.get(cur, cur)
 
 def load_model():
+    """Load your trained model [yield_t_ha, protein_as_is_pct]. Fallback keeps app usable."""
     if os.path.exists(MODEL_PATH):
         try:
             return joblib.load(MODEL_PATH)
         except Exception:
             pass
-    # Fallback keeps app usable
     class FallbackModel:
         def predict(self, X: pd.DataFrame) -> np.ndarray:
             n = X["n_rate"].values
-            yld = 6.5 + 0.035*n - 0.00007*(n**2)              # t/ha, diminishing returns
+            yld = 6.5 + 0.035*n - 0.00007*(n**2)              # t/ha
             yld = np.clip(yld, 3.5, 12.0)
             prot_as_is = np.clip(7.5 + 0.010*n, 7.0, 12.0)    # % as-is
             return np.c_[yld, prot_as_is]
@@ -104,10 +104,15 @@ def predict_yield_and_protein_as_is(n_rate: float, p_rate: float) -> Tuple[float
     return float(yld), float(prot)
 
 def as_is_to_dm(protein_as_is_pct: float, moisture_pct: float) -> float:
+    """Convert protein measured on wet (as-is) basis to dry matter basis."""
     m = max(0.0, min(40.0, moisture_pct)) / 100.0
     return protein_as_is_pct / (1.0 - m)
 
 def estimate_starch_dm(protein_dm_pct: float, protector_on: bool) -> Tuple[float, float]:
+    """
+    Simple proxy: starch inversely tracks protein. Base 64% starch DM at 10% protein DM.
+    Protector ON nudges starch up by +0.6 abs. Returns a band ±0.8 abs.
+    """
     base = 64.0 - 0.7*(protein_dm_pct - 10.0)
     if protector_on: base += 0.6
     return max(55.0, min(72.0, base - 0.8)), max(55.0, min(72.0, base + 0.8))
@@ -154,7 +159,6 @@ with st.sidebar:
     c1, c2 = st.columns(2)
     with c1:
         n_rate = st.number_input("Nitrogen rate (kg N/ha)", 0.0, 400.0, 160.0, 5.0)
-        # Barley type selector + context-aware price label
         barley_type = st.radio("Barley type", options=["Malting", "Feed"], index=0,
                                help="Switches the reference price between malting and feed.")
         default_malting = 320.0
@@ -218,7 +222,6 @@ st.markdown(
     f'<div class="val">{starch_low:.1f}–{starch_high:.1f}%</div></div>',
     unsafe_allow_html=True
 )
-
 margin_per_ha, margin_total, _tmp = gross_margin_simple(inputs, yield_t_ha)
 st.markdown(
     '<div class="kpi"><h4>Gross margin (per ha)</h4>'
@@ -232,7 +235,7 @@ c1, c2 = st.columns((1.1, 1.0), gap="large")
 
 with c1:
     st.subheader("Estimated quality (proxy)")
-    st.caption("Protein range is ±0.5% abs around prediction (DM). Starch proxy inversely tracks protein; phosphate protector adds ~+0.6% abs.")
+    st.caption("Protein range is ±0.5% abs around prediction (DM). Starch proxy inversely tracks protein; phosphate protector adds ≈+0.6% abs.")
     qc1, qc2 = st.columns(2)
     with qc1:
         st.markdown(
@@ -260,7 +263,7 @@ with c2:
 
 # ================== What-if Advisor (Azure GenAI) ==================
 st.subheader("Ask the Generative AI advisor")
-st.caption("Powered by Azure OpenAI when configured. Try: *“What if I reduce N by 15%?”*")
+st.caption("Powered by Azure OpenAI when configured. Try: “What if I reduce N by 15%?”")
 
 AZURE_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "")
 AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "")
@@ -288,18 +291,24 @@ def call_azure_genai(prompt: str, context: dict) -> str:
             return r.json()["choices"][0]["message"]["content"].strip()
         except Exception as e:
             return f"(Azure call failed; local fallback) {e}"
-    return ("Azure advisor not configured. Heuristic: lowering N ~15% usually reduces protein DM by ~0.1–0.3 abs; "
+    # Fallback text avoids tildes to prevent Markdown strikethrough
+    return ("Azure advisor not configured. Heuristic: lowering N ≈15% usually reduces protein (DM) by ≈0.1–0.3 percentage points; "
             "yield response varies by season. Urea savings can improve margin when grain prices are soft. "
-            "Protector adds cost but may nudge starch DM upward (~+0.6 abs here).")
+            "Protector adds cost but may nudge starch DM upward (≈+0.6 pp here).")
 
-if "chat_history" not in st.session_state: st.session_state.chat_history = []
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
+# Render prior messages
 for role, content in st.session_state.chat_history:
-    with st.chat_message(role): st.markdown(content)
+    with st.chat_message(role):
+        st.markdown(content)
 
 user_msg = st.chat_input("Ask a question (e.g., “What if I reduce N by 15%?”)")
 if user_msg:
     st.session_state.chat_history.append(("user", user_msg))
-    with st.chat_message("user"): st.markdown(user_msg)
+    with st.chat_message("user"):
+        st.markdown(user_msg)
 
     context = {
         "yield_t_ha": round(yield_t_ha, 2),
@@ -318,8 +327,11 @@ if user_msg:
         "margin_per_ha": round(margin_per_ha, 0),
     }
     reply = call_azure_genai(user_msg, context)
-    st.session_state.chat_history.append(("assistant", reply))
-    with st.chat_message("assistant"): st.markdown(reply)
+    # Sanitize tildes to avoid accidental strikethrough in Markdown
+    safe_reply = reply.replace("~", r"\~")
+    st.session_state.chat_history.append(("assistant", safe_reply))
+    with st.chat_message("assistant"):
+        st.markdown(safe_reply)
 
 # ================== Footer ==================
 st.markdown(
