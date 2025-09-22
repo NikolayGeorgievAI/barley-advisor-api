@@ -20,16 +20,15 @@ model = load_model()
 # ---------------- Discover expected features ----------------
 EXPECTED = getattr(model, "feature_names_in_", None)
 
-if EXPECTED is None:
-    # Try to find feature_names_in_ on a step inside a pipeline
-    if hasattr(model, "named_steps"):
-        for step in model.named_steps.values():
-            cols = getattr(step, "feature_names_in_", None)
-            if cols is not None:
-                EXPECTED = cols
-                break
+if EXPECTED is None and hasattr(model, "named_steps"):
+    for step in model.named_steps.values():
+        cols = getattr(step, "feature_names_in_", None)
+        if cols is not None:
+            EXPECTED = cols
+            # instead of break, just exit the loop safely
+            break
 
-# Safe emptiness check (works for list or numpy array)
+# Safe emptiness check
 if EXPECTED is None or len(EXPECTED) == 0:
     st.error(
         "Model does not expose expected input feature names. "
@@ -37,8 +36,9 @@ if EXPECTED is None or len(EXPECTED) == 0:
     )
     st.stop()
 
-# Ensure plain Python list
+# Ensure plain list
 EXPECTED = list(EXPECTED)
+
 
 # ---------------- Introspect categories from encoders ----------------
 def discover_categorical_options(m) -> Dict[str, List[Any]]:
@@ -166,3 +166,4 @@ with st.expander("Debug (optional)"):
     if CATEGORICAL_OPTIONS:
         st.write("Categorical options discovered from model encoders:")
         st.json(CATEGORICAL_OPTIONS)
+
