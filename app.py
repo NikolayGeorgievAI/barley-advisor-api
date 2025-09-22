@@ -108,7 +108,6 @@ if st.button("Predict"):
         for c in EXPECTED:
             v = user_vals.get(c)
             v = to_scalar(v)
-            # try float if numeric-looking
             try:
                 v = float(v)
             except Exception:
@@ -117,22 +116,25 @@ if st.button("Predict"):
 
         X = pd.DataFrame([clean_row], columns=EXPECTED)
 
-        st.write("**Debug — Input DataFrame:**")
-        st.dataframe(X)
-
         y = model.predict(X)
 
         st.write("**Debug — Raw prediction output:**")
         st.write(repr(y))
 
+        # unwrap prediction
         if isinstance(y, (list, tuple, np.ndarray)):
-            y = y[0]
+            y = np.array(y).flatten()
 
-        st.success(f"Predicted yield: **{float(y):.2f} t/ha**")
+        if len(y) == 1:
+            st.success(f"Prediction: **{float(y[0]):.2f}**")
+        else:
+            st.success(f"Predicted yield: **{y[0]:.2f} t/ha**")
+            st.success(f"Predicted protein: **{y[1]:.2f} %**")
 
     except Exception as e:
         st.error("Prediction failed — see details below.")
         st.code(repr(e))
+
 
 
 
