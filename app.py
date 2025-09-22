@@ -1,21 +1,19 @@
-import joblib, pandas as pd, os
-from fastapi import FastAPI, Header, HTTPException
-from pydantic import BaseModel
-from typing import Dict, Any
+import streamlit as st
+from pathlib import Path
+import sys, os, platform
 
-API_KEY = os.getenv("PREDICT_KEY", "dev-key")
-pipe = joblib.load("barley_model/model.pkl")
-TARGETS = ["grain_protein_pct","yield_t_ha"]
+st.set_page_config(page_title="Barley Advisor (diag)", layout="centered")
+st.title("🌾 Barley Advisor — diagnostic")
 
-class PredictIn(BaseModel):
-    features: Dict[str, Any]
+# --- Basic render proof ---
+st.success("UI is alive ✅")
 
-app = FastAPI()
+# --- Repo / files ---
+cwd = Path(".").resolve()
+st.write("**Working directory:**", str(cwd))
+st.write("**Top-level files:**", sorted([p.name for p in cwd.iterdir()]))
 
-@app.post("/predict")
-def predict(inp: PredictIn, x_api_key: str = Header(None)):
-    if x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    df = pd.DataFrame([inp.features])
-    y = pipe.predict(df)[0].tolist()
-    return {"targets": TARGETS, "pred": y}
+model_pkl = Path("barley_model/model.pkl")
+model_skops = Path("barley_model/model.skops")
+
+st.write("**barley**
