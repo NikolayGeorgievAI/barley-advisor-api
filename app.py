@@ -134,10 +134,9 @@ with st.container():
 st.markdown("---")
 st.subheader("Ask the advisor")
 
-# Small helper to read Azure secrets safely
+# Small helper to read Azure secrets safely (unchanged)
 def read_azure_secrets():
     data = st.secrets.get("azure", {})
-    # Normalize keys that users often vary
     key = data.get("api_key") or data.get("key")
     endpoint = (data.get("endpoint") or "").rstrip("/")
     deployment = data.get("deployment")
@@ -146,126 +145,143 @@ def read_azure_secrets():
 
 azure_key, azure_endpoint, azure_deployment, azure_api_version = read_azure_secrets()
 
-# Nice banner when misconfigured
 def azure_configured() -> bool:
-    ok = True
     missing = []
-    if not azure_key:
-        missing.append("azure.api_key")
-    if not azure_endpoint:
-        missing.append("azure.endpoint")
-    if not azure_deployment:
-        missing.append("azure.deployment")
-    if not azure_api_version:
-        missing.append("azure.api_version")
+    if not azure_key:        missing.append("azure.api_key")
+    if not azure_endpoint:   missing.append("azure.endpoint")
+    if not azure_deployment: missing.append("azure.deployment")
+    if not azure_api_version:missing.append("azure.api_version")
     if missing:
         st.info(
             ":orange[Azure OpenAI not configured] — add " + ", ".join(missing) +
             " in **Streamlit → Settings → Secrets** to enable the chatbot."
         )
-        ok = False
-    return ok
+        return False
+    return True
 
-# Advisor options
-with st.expander("Advisor settings (optional)", expanded=False):
-    use_context = st.checkbox("Include my latest prediction & inputs as context", value=True)
-    tone = st.selectbox("Tone", ["Concise", "Detailed"], index=0)
+# Layout: left = chat (immediately after predictions), right = advisor settings
+left_col, right_col = st.columns([3, 1], vertical_alignment="top")
 
-# Initialize chat state
-if "chat_messages" not in st.session_state:
-    st.session_state.chat_messages = [
-        {
+# ---- RIGHT: settings (narrow) ------------------------------------------------
+with right_col:
+    # Optional sticky effect for the right column (stays visible while scrolling)
+    st.markdown(
+        """
+        <style>
+        .sticky-box {position: sticky; top: 90px;}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    with st.container():
+        st.markdown("<div class='sticky-box'>", unsafe_allow_html=True)
+
+        with st.expander("Advisor settings (optional)", expanded=False):
+            # session settings
+            if "advisor_tone" not in st.session_state:
+                st.session_state.advisor_tone = "Concise"
+            if "advisor_use_context" not in st.session_state:
+                st.session_state.advisor_use_context = True
+
+            st.session_state.advisor_use_context = st.checkbox(
+                "Include my latest prediction & inputs as context",
+                value=st.session_state.advisor_use_context,
+            )
+            st.session_state.advisor_tone = st.selectbox(
+                "Tone",
+                ["Concise", "Detailed"],
+                index=0 if st.session_state.advisor_tone == "Concise" else 1,
+            )
+        st.markdown("</div>", unsafe_allow_html=True)
+
+# ---- LEFT: chat area ---------------------------------------------------------
+with left_col:
+    # Initialize chat memory
+    if "chat_messages" not in st.session_state:
+        st.session_state.chat_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are Barley Advisor, a helpful agronomy assistant. "
+                    "Provide practical, cautious guidance for spring barley in temperate climates. "
+                    "Use simple language and actionable steps. "
+                    "Never claim certainty; recommend consulting local agronomy guidance."
+                ),
+            }
+        ]
+
+    # Helper to add contextual system message (prediction + inputs)
+    def add_context_message():
+        lp = st.session_state.get("last_prediction")
+        if not lp:
+            return None
+        ctx = {
+            "predicted_yield_t_ha": lp.get("yield_t_ha"),
+            "predicted_protein_pct": lp.get("protein_pct"),
+            "inputs": lp.get("inputs"),
+        }
+        return {
             "role": "system",
             "content": (
-                "You are Barley Advisor, a helpful agronomy assistant. "
-                "You provide practical, cautious guidance for spring barley in temperate climates. "
-                "Use simple language and provide specific, actionable suggestions. "
-                "Never claim certainty; recommend consulting local agronomy guidance."
+                "Context from the prediction tool (if available). "
+                f"JSON: {json.dumps(ctx)}. "
+                "Use this to tailor recommendations (e.g., protein high for malting)."
             ),
         }
-    ]
 
-# Helper to add contextual system message
-def add_context_message():
-    lp = st.session_state.get("last_prediction")
-    if not lp:
-        return None
-    inputs = lp["inputs"]
-    ctx = {
-        "predicted_yield_t_ha": lp.get("yield_t_ha"),
-        "predicted_protein_pct": lp.get("protein_pct"),
-        "inputs": inputs,
-    }
-    return {
-        "role": "system",
-        "content": (
-            "Context from the prediction tool (if available). "
-            f"JSON: {json.dumps(ctx)}. "
-            "Use this context to tailor recommendations (e.g., protein too high for malting)."
-        ),
-    }
-
-# Render previous messages (assistant/user)
-def render_history():
+    # Render history
     for m in st.session_state.chat_messages:
         if m["role"] == "user":
             st.chat_message("user").markdown(m["content"])
         elif m["role"] == "assistant":
             st.chat_message("assistant").markdown(m["content"])
 
-render_history()
+    # Chat input directly under predictions
+    prompt = st.chat_input("Ask a question (e.g., “What if I reduce N by 15%?”)")
+    if prompt:
+        st.session_state.chat_messages.append({"role": "user", "content": prompt})
+        st.chat_message("user").markdown(prompt)
 
-prompt = st.chat_input("Ask a question (e.g., “What if I reduce N by 15%?”)")
-if prompt:
-    st.session_state.chat_messages.append({"role": "user", "content": prompt})
-    st.chat_message("user").markdown(prompt)
+        if not azure_configured():
+            st.stop()
 
-    if not azure_configured():
-        st.stop()
+        # Build request with optional context
+        messages = list(st.session_state.chat_messages)
+        if st.session_state.advisor_use_context:
+            ctx_msg = add_context_message()
+            if ctx_msg:
+                messages.insert(1, ctx_msg)
 
-    # Build request messages
-    messages = list(st.session_state.chat_messages)
-    if use_context:
-        ctx_msg = add_context_message()
-        if ctx_msg:
-            messages.insert(1, ctx_msg)  # after the base system prompt
+        try:
+            from openai import AzureOpenAI
+            client = AzureOpenAI(
+                api_key=azure_key,
+                api_version=azure_api_version,
+                azure_endpoint=azure_endpoint,
+            )
+            temp = 0.2 if st.session_state.advisor_tone == "Concise" else 0.5
+            resp = client.chat.completions.create(
+                model=azure_deployment,
+                messages=messages,
+                temperature=temp,
+                max_tokens=500,
+            )
+            answer = resp.choices[0].message.content if resp and resp.choices else "I couldn’t generate a response."
+            st.session_state.chat_messages.append({"role": "assistant", "content": answer})
+            st.chat_message("assistant").markdown(answer)
 
-    # Call Azure OpenAI with clean error handling
-    try:
-        # We use the new OpenAI SDK naming for Azure
-        from openai import AzureOpenAI
+        except Exception as e:
+            msg = str(e)
+            hint = ""
+            if "401" in msg or "Access denied" in msg:
+                hint = "Check API key & subscription; ensure endpoint region matches deployment."
+            elif "404" in msg:
+                hint = "Verify the `deployment` name in secrets matches your Azure OpenAI Deployment."
+            elif "Name or service not known" in msg or "ENOTFOUND" in msg:
+                hint = "Endpoint may be wrong. It should look like https://<resource>.openai.azure.com/"
+            elif "429" in msg:
+                hint = "Possible rate limiting; try again shortly."
 
-        client = AzureOpenAI(
-            api_key=azure_key,
-            api_version=azure_api_version,
-            azure_endpoint=azure_endpoint,
-        )
-
-        temp = 0.2 if tone == "Concise" else 0.5
-        resp = client.chat.completions.create(
-            model=azure_deployment,  # this is your Deployment name in Azure
-            messages=messages,
-            temperature=temp,
-            max_tokens=500,
-        )
-
-        answer = resp.choices[0].message.content if resp and resp.choices else "I couldn’t generate a response."
-        st.session_state.chat_messages.append({"role": "assistant", "content": answer})
-        st.chat_message("assistant").markdown(answer)
-
-    except Exception as e:
-        # Parse common Azure errors for clarity
-        msg = str(e)
-        hint = ""
-        if "401" in msg or "Access denied" in msg:
-            hint = "Check your API key & subscription are active, and the endpoint region matches your deployment."
-        elif "404" in msg:
-            hint = "Check the `deployment` name in secrets — it must match the Azure OpenAI Deployment."
-        elif "Name or service not known" in msg or "getaddrinfo ENOTFOUND" in msg:
-            hint = "Your `endpoint` looks wrong. It should look like: https://<resource-name>.openai.azure.com/"
-        elif "429" in msg:
-            hint = "You may be rate limited. Try again in a bit or lower the frequency."
-
-        st.warning("Azure call failed. " + (hint or "See error details below."))
-        with st.expander("Error details"):
-            st.code(msg, language="text")
+            st.warning("Azure call failed. " + (hint or "See error details below."))
+            with st.expander("Error details"):
+                st.code(msg, language="text")
