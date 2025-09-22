@@ -97,7 +97,6 @@ if st.button("Predict"):
     import numpy as np
 
     def to_scalar(v):
-        """Force any input into a plain Python scalar or string."""
         if isinstance(v, (list, tuple, np.ndarray)):
             if len(v) == 0:
                 return None
@@ -108,21 +107,24 @@ if st.button("Predict"):
         clean_row = []
         for c in EXPECTED:
             v = user_vals.get(c)
-
-            v = to_scalar(v)  # flatten arrays/lists
-            # try float conversion if it looks numeric
+            v = to_scalar(v)
+            # try float if numeric-looking
             try:
                 v = float(v)
             except Exception:
-                # leave strings (categoricals) untouched
                 pass
-
             clean_row.append(v)
 
         X = pd.DataFrame([clean_row], columns=EXPECTED)
 
+        st.write("**Debug — Input DataFrame:**")
+        st.dataframe(X)
+
         y = model.predict(X)
-        # y itself may be an array → unwrap
+
+        st.write("**Debug — Raw prediction output:**")
+        st.write(repr(y))
+
         if isinstance(y, (list, tuple, np.ndarray)):
             y = y[0]
 
@@ -131,4 +133,6 @@ if st.button("Predict"):
     except Exception as e:
         st.error("Prediction failed — see details below.")
         st.code(repr(e))
+
+
 
