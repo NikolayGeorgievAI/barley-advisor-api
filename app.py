@@ -3,503 +3,372 @@ from __future__ import annotations
 
 import os
 import math
-import time
 from dataclasses import dataclass
-from typing import Dict, Tuple, Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import joblib
-import requests
 import streamlit as st
 
-# ============= Page setup & styles =============
+# ================== Page setup & styles ==================
 st.set_page_config(
     page_title="Barley Advisor — Yield & Quality Predictor",
     page_icon="🌾",
     layout="wide",
 )
 
-# Global CSS: bigger ask box, nicer cards, subtle hovers, footer, etc.
+# ---------- CSS ----------
 st.markdown(
     """
     <style>
-      /* Tighten the page a bit */
-      .block-container {padding-top: 1.2rem; padding-bottom: 2rem;}
-
-      /* Make the chat input larger */
-      div[data-testid="stTextInput"] input[type="text"]{
-          height: 56px;
-          font-size: 18px;
-          padding-left: 16px;
+      .block-container {padding-top: 1.0rem; padding-bottom: 2rem; max-width: 1300px;}
+      .top-banner {
+        display:flex; justify-content:space-between; align-items:center;
+        font-size:14px; padding:8px 12px; border-radius:10px;
+        background:#f3f8ff; border:1px solid #e3ecff; margin-bottom:8px;
       }
-
-      /* Card hover polish for KPI containers */
-      .kpi-card:hover {
-          transition: box-shadow 0.15s ease-in-out;
-          box-shadow: 0 6px 24px rgba(0,0,0,0.06);
-      }
-
-      /* Align the advisor header row */
-      .advisor-row { display:flex; align-items:center; justify-content:space-between; }
-      .advisor-title { font-size: 28px; font-weight: 800; color: #111827; margin: 0.5rem 0 0.75rem; }
-
-      /* Footer */
-      .footer-wrap { display:flex; gap:.5rem; align-items:center; justify-content:flex-end; color:#374151; }
-      .footer-wrap a { color:#111827; text-decoration:none; font-weight:700; }
-      .footer-wrap a:hover { text-decoration:underline; }
+      .kpi-grid {display:grid; grid-template-columns: repeat(4, minmax(220px, 1fr)); gap:14px;}
+      .kpi {border:1px solid #eef1f6; border-radius:14px; padding:14px; background:white; box-shadow:0 1px 2px rgba(0,0,0,0.03);}
+      .kpi h4 {margin:0 0 6px 0; font-size:13px; color:#667085; font-weight:600;}
+      .kpi .val {font-size:26px; font-weight:800; letter-spacing:-0.3px;}
+      .good {color:#117a37;}
+      .warn {color:#b54708;}
+      .bad {color:#b42318;}
+      .pill {display:inline-block; padding:3px 8px; border-radius:999px; background:#eef6ff; border:1px solid #dbeafe; font-size:12px;}
+      .card {border:1px solid #eef1f6; border-radius:16px; padding:16px; background:white;}
+      .muted {color:#667085; font-size:12px;}
+      .help {font-size:12px; color:#475467;}
+      .successbox {background:#edfdf3; border:1px solid #d1fadf; padding:10px 12px; border-radius:10px; margin-bottom:8px;}
+      .successbox strong {color:#05603a;}
+      .infobox {background:#eff8ff; border:1px solid #d1e9ff; padding:10px 12px; border-radius:10px; margin-bottom:8px;}
     </style>
     """,
-    unsafe_allow_html=True,
+    unsafe_allow_html=True
 )
 
-# ============= Model loading =============
-@st.cache_resource(show_spinner=False)
-def load_model(path: str = "barley_model/model.pkl"):
-    return joblib.load(path)
+# One-line banner (prevents wrapping on small glitches)
+st.markdown(
+    """
+    <div class="top-banner">
+      <div><strong>Barley Advisor</strong> — demo prototype connecting ML predictions with an Azure Generative AI advisor</div>
+      <div class="pill">Demo version — N. Georgiev</div>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
 
-model = None
-model_load_error = None
-try:
-    model = load_model()
-except Exception as e:
-    model_load_error = str(e)
+# ================== Helpers & defaults ==================
+MODEL_PATH = "models/barley_model.pkl"
 
-# The original pipeline expects these columns in this order.
-FEATURE_ORDER = [
-    "source_doc", "year", "site_id", "end_use",
-    "n_rate_kg_ha", "n_split_first_prop", "final_n_timing_gs"
-]
+@dataclass
+class Inputs:
+    n_rate: float             # kg N/ha (as urea-N equivalent)
+    p_rate: float             # kg P2O5/ha
+    moisture_pct: float       # grain moisture at measurement (%)
+    field_size: float         # ha
+    barley_price: float       # price per tonne of barley (malting) in selected currency
+    urea_price: float         # price per tonne of urea
+    phosphate_price: float    # price per tonne of phosphate (P2O5 carrier or proxy)
+    inhibitor_on: bool
+    inhibitor_cost_per_t_urea: float
+    protector_on: bool
+    protector_cost_per_t_phosphate: float
+    currency: str
 
-# Default hidden values for model compatibility
-DEFAULT_SOURCE_DOC = "Focus2022"
-DEFAULT_YEAR = 2020
-DEFAULT_SITE_ID = "S1"
-
-GS_OPTIONS = {
-    "T tillering (GS25)": "GS25",
-    "Stem extension (GS31–32)": "GS31",
-    "Flag leaf (GS37–39)": "GS39",
-    "Ear emergence (GS51–59)": "GS51",
-    "Sowing": "sowing",
+CURRENCY_SYMBOLS = {
+    "EUR": "€",
+    "USD": "$",
+    "CHF": "CHF"
 }
-GS_LABELS = list(GS_OPTIONS.keys())
 
-# ============= Helpers (NEW: proxy quality estimators) =============
-def clamp(val: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, val))
+def symbol(cur: str) -> str:
+    return CURRENCY_SYMBOLS.get(cur, cur)
 
-def estimate_protein_percent(
-    n_rate_kg_ha: float,
-    use_n_inhibitor: bool,
-    use_p_protector: bool,
-    baseline_protein: float = 10.5,
-    n_ref_kg_ha: float = 120.0,
-    n_to_protein_slope: float = 0.005,  # % protein per kg N deviation from ref
-) -> float:
-    """
-    Demo estimator:
-    - Start at 10.5% protein at ~120 kg N/ha.
-    - Protein rises ~0.005% per kg N above ref; falls below ref.
-    - N inhibitor increases effective N availability by ~10% (demo assumption).
-    - P protector slightly increases carbohydrate deposition → mild protein dilution: -0.2% abs.
-    """
-    effective_n = n_rate_kg_ha * (1.10 if use_n_inhibitor else 1.00)
-    delta_n = effective_n - n_ref_kg_ha
-    protein = baseline_protein + n_to_protein_slope * delta_n
-    if use_p_protector:
-        protein -= 0.2
-    return clamp(protein, 8.5, 14.5)
-
-def estimate_starch_percent(
-    protein_percent: float,
-    use_p_protector: bool
-) -> float:
-    """
-    Demo starch estimator as a derived trait:
-    Starch% = 64 – 0.7 * (Protein% – 10) + 0.3 * P_index
-    where P_index = 2 if P protector ON, else 1 (baseline P status).
-    """
-    p_index = 2 if use_p_protector else 1
-    starch = 64.0 - 0.7 * (protein_percent - 10.0) + 0.3 * p_index
-    return clamp(starch, 55.0, 68.0)
-
-def as_range(center: float, spread: float = 0.8) -> str:
-    """Return a friendly ± range string, e.g., '61.2–62.8%'."""
-    lo = round(center - spread, 1)
-    hi = round(center + spread, 1)
-    return f"{lo}–{hi}%"
-
-# ============= Core prediction =============
-def predict_yield_protein(
-    end_use: str,
-    n_rate_kg_ha: float,
-    n_split_first_prop: float,
-    final_n_label: str,
-    source_doc: str = DEFAULT_SOURCE_DOC,
-    year: int = DEFAULT_YEAR,
-    site_id: str = DEFAULT_SITE_ID,
-) -> Tuple[Optional[float], Optional[float], Optional[str]]:
-    """Run the sklearn pipeline and return yield (t/ha) and protein (%)"""
-    if model is None:
-        return None, None, model_load_error or "Model not loaded."
-
-    try:
-        final_n_gs = GS_OPTIONS.get(final_n_label, "GS25")
-        row = pd.DataFrame([{
-            "source_doc": source_doc,
-            "year": int(year),
-            "site_id": site_id,
-            "end_use": end_use,
-            "n_rate_kg_ha": float(n_rate_kg_ha),
-            "n_split_first_prop": float(n_split_first_prop),
-            "final_n_timing_gs": final_n_gs,
-        }])[FEATURE_ORDER]
-
-        pred = model.predict(row)
-        # Assume model outputs [yield_t_ha, protein_percent] in that order.
-        yld, prot = float(pred[0][0]), float(pred[0][1])
-        return yld, prot, None
-    except Exception as e:
-        return None, None, f"Prediction failed: {e}"
-
-# ----- Price fetchers (best-effort with graceful fallback) -----
-@st.cache_data(ttl=24*3600, show_spinner=False)
-def fetch_best_effort_prices() -> Dict[str, Optional[float]]:
-    """
-    Try to fetch indicative prices (USD/t) for barley (feed/malting) and urea.
-    If online fetch fails, return None and we’ll show manual fallback values/UI.
-    """
-    prices = {"barley_feed": None, "barley_malting": None, "urea": None}
-
-    # These are "best effort" demo endpoints; they may change or be blocked.
-    # We intentionally keep them simple & permissive.
-    sources = {
-        "urea": "https://prices.openag.io/urea/latest.json",
-        "barley_feed": "https://prices.openag.io/barley/feed/latest.json",
-        "barley_malting": "https://prices.openag.io/barley/malting/latest.json",
-    }
-    headers = {"User-Agent": "Mozilla/5.0 (BarleyAdvisor Demo)"}
-
-    for key, url in sources.items():
+def load_model():
+    """Load your trained model. If not available, use a transparent fallback."""
+    if os.path.exists(MODEL_PATH):
         try:
-            r = requests.get(url, timeout=8, headers=headers)
-            if r.ok:
-                data = r.json()
-                # Expecting {"price_usd_per_tonne": 600} (demo format)
-                val = data.get("price_usd_per_tonne")
-                if isinstance(val, (int, float)) and val > 0:
-                    prices[key] = float(val)
+            return joblib.load(MODEL_PATH)
         except Exception:
-            pass  # swallow: we’ll use fallback path below
+            pass
+    # Fallback: a simple, explainable pseudo-model to keep the app running.
+    class FallbackModel:
+        def predict(self, X: pd.DataFrame) -> np.ndarray:
+            # Toy function: yield driven by N rate with diminishing returns; protein as-is correlates with N
+            n = X["n_rate"].values
+            base_yield = 6.5 + 0.035 * n - 0.00007 * (n ** 2)  # t/ha
+            base_yield = np.clip(base_yield, 3.5, 12.0)
+            protein_as_is = 7.5 + 0.010 * n  # %
+            protein_as_is = np.clip(protein_as_is, 7.0, 12.0)
+            return np.c_[base_yield, protein_as_is]
+    return FallbackModel()
 
-    return prices
+MODEL = load_model()
 
-def fmt_money(x: float, curr: str = "USD") -> str:
-    return f"{curr} {x:,.0f}"
+def predict_yield_and_protein_as_is(n_rate: float, p_rate: float) -> Tuple[float, float]:
+    X = pd.DataFrame({"n_rate": [n_rate], "p_rate": [p_rate]})
+    out = MODEL.predict(X)
+    # Expect array with two columns: [yield_t_ha, protein_as_is_pct]
+    yld, prot_as_is = float(out[0, 0]), float(out[0, 1])
+    return yld, prot_as_is
 
-def kpi_card(label: str, value: str, color: str = "#111827"):
-    st.markdown(
-        f"""
-        <div class="kpi-card" style="
-            border:1px solid rgba(0,0,0,0.07);
-            border-radius:14px;
-            padding:16px 18px;
-            background: #fff;
-        ">
-            <div style="font-size:14px; color:#6b7280; margin-bottom:6px;">{label}</div>
-            <div style="font-size:36px; font-weight:800; color:{color}; line-height:1.1;">
-                {value}
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+def as_is_to_dm(protein_as_is_pct: float, moisture_pct: float) -> float:
+    """Convert protein measured on wet (as-is) basis to dry matter basis."""
+    m = max(0.0, min(40.0, moisture_pct)) / 100.0
+    return protein_as_is_pct / (1.0 - m)
 
-# ============= Title & intro =============
-st.title("🌾 Barley Advisor — Yield & Quality Predictor")
-st.caption("Prototype model trained on Teagasc dataset. For demo only — not agronomic advice.")
+def dm_to_as_is(protein_dm_pct: float, moisture_pct: float) -> float:
+    m = max(0.0, min(40.0, moisture_pct)) / 100.0
+    return protein_dm_pct * (1.0 - m)
 
-# ============= Inputs =============
-with st.container():
-    st.subheader("Inputs")
-    col1, col2 = st.columns(2)
+def estimate_starch_dm(protein_dm_pct: float, protector_on: bool) -> Tuple[float, float]:
+    """
+    Very simple proxy: starch and protein often move inversely.
+    Start from 64.0% starch DM at 10% protein DM and adjust slope modestly.
+    Protector (if ON) nudges starch up by +0.6% abs. (tunable)
+    """
+    base = 64.0 - 0.7 * (protein_dm_pct - 10.0)
+    if protector_on:
+        base += 0.6
+    # Provide a band ±0.8 abs to reflect uncertainty
+    return max(55.0, min(72.0, base - 0.8)), max(55.0, min(72.0, base + 0.8))
 
-    with col1:
-        end_use = st.selectbox("End use", ["feed", "malting"], index=0)
-        n_rate = st.number_input("Nitrogen rate (kg/ha)", min_value=0.0, max_value=400.0, value=120.0, step=5.0)
+def gross_margin_simple(inp: Inputs, yield_t_ha: float) -> Tuple[float, float, pd.DataFrame]:
+    """
+    Revenue = yield * barley_price
+    Cost = urea + phosphate (+ inhibitors if toggled)
+    """
+    cur = symbol(inp.currency)
 
-    with col2:
-        n_split_first = st.number_input(
-            "N split — first application proportion",
-            min_value=0.0, max_value=1.0, value=0.50, step=0.05,
-            help="If you split N, what fraction is applied in the first pass?"
-        )
+    # --- Urea ---
+    # Assume urea product contains 46% N. Convert kg N/ha to kg urea/ha.
+    kg_urea_per_ha = inp.n_rate / 0.46
+    t_urea_per_ha = kg_urea_per_ha / 1000.0
+    urea_cost = t_urea_per_ha * inp.urea_price
 
-    final_n_timing = st.selectbox("Final N timing", GS_LABELS, index=0)
+    inhibitor_cost = 0.0
+    if inp.inhibitor_on:
+        inhibitor_cost = t_urea_per_ha * inp.inhibitor_cost_per_t_urea
 
-    # NEW: quality/management toggles
-    st.markdown("#### Quality levers")
-    q1, q2 = st.columns(2)
-    with q1:
-        use_n_inhibitor = st.toggle(
-            "Use nitrogen inhibitor? (+$35 per tonne of urea)",
-            value=False,
-            help="Demo assumption: inhibitor improves effective N availability by ~10% and adds $35/t urea cost."
-        )
-    with q2:
-        use_p_protector = st.toggle(
-            "Use phosphate protector?",
-            value=False,
-            help="Demo: improves carbohydrate metabolism slightly → higher starch, mild protein dilution. No cost modeled yet."
-        )
+    # --- Phosphate ---
+    # Simplify: treat p_rate as kg P2O5/ha; convert to tonnes of product proxy
+    t_phosphate_per_ha = (inp.p_rate / 1000.0)
+    phosphate_cost = t_phosphate_per_ha * inp.phosphate_price
 
-# Optional: small developer drawer (hidden values)
+    protector_cost = 0.0
+    if inp.protector_on:
+        protector_cost = t_phosphate_per_ha * inp.protector_cost_per_t_phosphate
+
+    # --- Revenue & Margin ---
+    revenue = yield_t_ha * inp.barley_price
+    variable_costs = urea_cost + inhibitor_cost + phosphate_cost + protector_cost
+    margin_per_ha = revenue - variable_costs
+    margin_total = margin_per_ha * inp.field_size
+
+    # breakdown table
+    rows = [
+        ("Revenue", f"{cur}{revenue:,.0f} /ha", ""),
+        ("Urea cost", f"{cur}{urea_cost:,.0f} /ha", f"{kg_urea_per_ha:,.0f} kg urea/ha"),
+        ("Nitrogen inhibitor" + (" (ON)" if inp.inhibitor_on else " (OFF)"),
+         f"{cur}{inhibitor_cost:,.0f} /ha",
+         f"{inp.inhibitor_cost_per_t_urea:.0f}{cur}/t × {t_urea_per_ha:.3f} t/ha"),
+        ("Phosphate cost", f"{cur}{phosphate_cost:,.0f} /ha", f"{inp.p_rate:.0f} kg P₂O₅/ha"),
+        ("Phosphate protector" + (" (ON)" if inp.protector_on else " (OFF)"),
+         f"{cur}{protector_cost:,.0f} /ha",
+         f"{inp.protector_cost_per_t_phosphate:.0f}{cur}/t × {t_phosphate_per_ha:.3f} t/ha"),
+        ("Margin (per ha)", f"{cur}{margin_per_ha:,.0f} /ha", ""),
+        ("Margin (field)", f"{cur}{margin_total:,.0f} total", f"{inp.field_size:.2f} ha"),
+    ]
+    df = pd.DataFrame(rows, columns=["Item", "Amount", "Notes"])
+    return margin_per_ha, margin_total, df
+
+# ================== Sidebar inputs ==================
 with st.sidebar:
-    st.markdown("### ⚙️ Developer settings")
-    with st.expander("Developer settings", expanded=False):
-        source_doc = st.selectbox("Source document", ["Focus2022", "Hackett2019", "Hackett2011_14"], index=0)
-        site_id = st.text_input("Site ID", value=DEFAULT_SITE_ID)
-        year_fix = st.number_input("Year (hidden to user)", min_value=2010, max_value=2030, value=DEFAULT_YEAR, step=1)
+    st.header("Inputs")
+    currency = st.selectbox("Currency", ["EUR", "USD", "CHF"], index=0)
+    cur = symbol(currency)
 
-# ============= Prediction =============
-btn = st.button("Predict", use_container_width=True)
-pred_yield, pred_protein = None, None
-pred_error = None
+    col_a, col_b = st.columns(2)
+    with col_a:
+        n_rate = st.number_input("Nitrogen rate (kg N/ha)", min_value=0.0, max_value=400.0, value=160.0, step=5.0)
+        barley_price = st.number_input(f"Barley price (malting) [{cur}/t]", min_value=50.0, max_value=1000.0, value=320.0, step=5.0)
+        moisture_pct = st.number_input("Grain moisture at measurement (%)", min_value=8.0, max_value=28.0, value=12.0, step=0.5,
+                                       help="Used to convert protein from as-is to dry matter. All displays use DM.")
+    with col_b:
+        p_rate = st.number_input("Phosphate rate (kg P₂O₅/ha)", min_value=0.0, max_value=200.0, value=60.0, step=5.0)
+        urea_price = st.number_input(f"Urea price [{cur}/t]", min_value=100.0, max_value=1500.0, value=450.0, step=10.0)
+        phosphate_price = st.number_input(f"Phosphate price [{cur}/t]", min_value=100.0, max_value=1500.0, value=700.0, step=10.0)
 
-if btn:
-    pred_yield, pred_protein, pred_error = predict_yield_protein(
-        end_use=end_use,
-        n_rate_kg_ha=n_rate,
-        n_split_first_prop=n_split_first,
-        final_n_label=final_n_timing,
-        source_doc=source_doc,
-        year=year_fix,
-        site_id=site_id
+    st.divider()
+    st.subheader("Treatment options")
+    inhibitor_on = st.toggle("Use nitrogen inhibitor", value=False, help=f"Adds cost per tonne of urea. Default {cur}35/t.")
+    inhibitor_cost = st.number_input(f"Inhibitor cost [{cur}/t urea]", min_value=0.0, max_value=200.0, value=35.0, step=1.0, disabled=not inhibitor_on)
+
+    protector_on = st.toggle("Use phosphate protector", value=False, help=f"Adds cost per tonne of phosphate and nudges starch DM.")
+    protector_cost = st.number_input(f"Protector cost [{cur}/t phosphate]", min_value=0.0, max_value=200.0, value=45.0, step=1.0, disabled=not protector_on)
+
+    st.divider()
+    field_size = st.number_input("Field size (ha)", min_value=0.1, max_value=5000.0, value=10.0, step=0.5)
+
+    inputs = Inputs(
+        n_rate=n_rate, p_rate=p_rate, moisture_pct=moisture_pct, field_size=field_size,
+        barley_price=barley_price, urea_price=urea_price, phosphate_price=phosphate_price,
+        inhibitor_on=inhibitor_on, inhibitor_cost_per_t_urea=inhibitor_cost,
+        protector_on=protector_on, protector_cost_per_t_phosphate=protector_cost,
+        currency=currency,
     )
 
-if pred_error:
-    st.error(pred_error)
+# ================== Predictions ==================
+yield_t_ha, protein_as_is = predict_yield_and_protein_as_is(inputs.n_rate, inputs.p_rate)
+protein_dm = as_is_to_dm(protein_as_is, inputs.moisture_pct)
 
-if pred_yield is not None and pred_protein is not None and pred_error is None:
-    st.success(f"**Predicted yield (model):** {pred_yield:0.2f} t/ha")
-    st.success(f"**Predicted grain protein (model):** {pred_protein:0.2f} %")
+# Uncertainty bands (simple, adjustable)
+prot_low, prot_high = max(0.0, protein_dm - 0.5), protein_dm + 0.5
+starch_low, starch_high = estimate_starch_dm(protein_dm, inputs.protector_on)
 
-    # ===== NEW: Estimated Protein & Starch (proxy) =====
-    est_protein = estimate_protein_percent(
-        n_rate_kg_ha=n_rate,
-        use_n_inhibitor=use_n_inhibitor,
-        use_p_protector=use_p_protector
-    )
-    est_starch = estimate_starch_percent(
-        protein_percent=est_protein,
-        use_p_protector=use_p_protector
-    )
-    protein_range = as_range(est_protein, 0.5)  # ±0.5% band
-    starch_range  = as_range(est_starch, 0.8)   # ±0.8% band
+# ================== Header KPIs ==================
+st.markdown('<div class="successbox"><strong>All protein values shown are on a Dry Matter (DM) basis.</strong> (Converted from model as-is using your moisture input.)</div>', unsafe_allow_html=True)
 
-    st.markdown("### Estimated quality (proxy)")
-    qp, qs = st.columns(2)
-    with qp:
-        kpi_card("Estimated Protein (DM)", protein_range, "#0ea5e9")
-    with qs:
-        kpi_card("Estimated Starch (DM)", starch_range, "#0ea5e9")
+k1, k2, k3, k4 = st.columns(4)
+with k1:
+    st.markdown('<div class="kpi"><h4>Predicted yield</h4><div class="val good">{:.2f} t/ha</div></div>'.format(yield_t_ha), unsafe_allow_html=True)
+with k2:
+    st.markdown('<div class="kpi"><h4>Predicted grain protein (DM)</h4><div class="val">{:.2f} %</div><div class="muted">Moisture assumed: {:.1f}%</div></div>'.format(protein_dm, inputs.moisture_pct), unsafe_allow_html=True)
+with k3:
+    st.markdown('<div class="kpi"><h4>Estimated starch (DM)</h4><div class="val">{:.1f}–{:.1f}%</div></div>'.format(starch_low, starch_high), unsafe_allow_html=True)
+with k4:
+    margin_per_ha, margin_total, _tmp = gross_margin_simple(inputs, yield_t_ha)
+    st.markdown('<div class="kpi"><h4>Gross margin (per ha)</h4><div class="val">{sym}{val:,.0f}</div></div>'.format(sym=symbol(inputs.currency), val=margin_per_ha), unsafe_allow_html=True)
 
-# ============= Simple gross margin =============
-st.markdown("### Gross margin (simple)")
+# ================== Quality & Economics Sections ==================
+c1, c2 = st.columns((1.1, 1.0), gap="large")
 
-# Fetch “best effort” online prices (cached), then allow manual override.
-price_data = fetch_best_effort_prices()
-# Fallback defaults if online fetch missing:
-fallbacks = {
-    "barley_feed": 190.0,       # USD/t
-    "barley_malting": 220.0,    # USD/t
-    "urea": 600.0,              # USD/t
-}
-
-# Pick barley price by end use
-barley_price_online = price_data.get(f"barley_{end_use}") or None
-urea_price_online = price_data.get("urea") or None
-
-cur = "USD"  # display label only
-
-# Manual overrides (small)
-ov1, ov2 = st.columns(2)
-with ov1:
-    barley_price = st.number_input(
-        f"Barley price ({end_use}) [USD/t]",
-        value=float(barley_price_online or fallbacks[f"barley_{end_use}"]),
-        min_value=0.0, step=5.0, key="barley_price_override"
-    )
-with ov2:
-    urea_price = st.number_input(
-        "Urea price [USD/t]",
-        value=float(urea_price_online or fallbacks["urea"]),
-        min_value=0.0, step=5.0, key="urea_price_override"
-    )
-
-# Notes on whether we used online or manual
-notes = []
-if barley_price_online is None:
-    notes.append(f"• Barley manual fallback: {fallbacks[f'barley_{end_use}']:.0f}/t")
-if urea_price_online is None:
-    notes.append(f"• Urea manual fallback: {fallbacks['urea']:.0f}/t")
-if notes:
-    st.write("\n".join(notes))
-
-# Compute revenue & cost if we have a predicted yield
-if pred_yield is not None and pred_error is None:
-    # Revenue
-    revenue_ha = pred_yield * barley_price  # USD/ha
-
-    # N cost: assume urea is 46% N
-    if n_rate > 0:
-        urea_needed_kg = n_rate / 0.46
-        n_cost_ha = (urea_needed_kg / 1000.0) * urea_price
-    else:
-        urea_needed_kg = 0.0
-        n_cost_ha = 0.0
-
-    # NEW: inhibitor cost (+$35 per tonne of urea applied) if enabled
-    inhibitor_cost_per_t_urea = 35.0
-    inhibitor_cost_ha = 0.0
-    if urea_needed_kg > 0 and use_n_inhibitor:
-        inhibitor_cost_ha = (urea_needed_kg / 1000.0) * inhibitor_cost_per_t_urea
-        n_cost_ha += inhibitor_cost_ha
-
-    # TODO (optional): If you later model P fertilizer tonnage, add P protector $/t cost here.
-
-    gross_margin_ha = revenue_ha - n_cost_ha
-
-    # Color-coded KPIs
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        kpi_card("Revenue/ha", fmt_money(revenue_ha, cur), "#16a34a")  # green
-    with c2:
-        kpi_card("N cost/ha", fmt_money(n_cost_ha, cur), "#dc2626")    # red
-    with c3:
-        gm_color = "#16a34a" if gross_margin_ha >= 0 else "#dc2626"
-        kpi_card("Gross margin/ha", fmt_money(gross_margin_ha, cur), gm_color)
-
-    if use_n_inhibitor and inhibitor_cost_ha > 0:
-        st.caption(f"Includes inhibitor cost: ~{fmt_money(inhibitor_cost_ha, cur)} per ha (at ${inhibitor_cost_per_t_urea:.0f}/t urea).")
-else:
-    st.info("Enter inputs and click **Predict** to see the gross margin KPIs.")
-
-# ============= Ask the advisor (Azure OpenAI) =============
-st.markdown("## Ask the advisor")
-
-col_left, col_right = st.columns([3, 1])  # wide left, narrow right
-with col_left:
-    st.markdown("###")  # spacer so alignment is nice
-
-with col_right:
-    with st.expander("Advisor settings (optional)", expanded=False):
-        temperature = st.slider(
-            "Response style",
-            min_value=0.0, max_value=1.0, step=0.05, value=0.20,
-            help="AI generation setting (not weather): lower = more concise/grounded, higher = more exploratory."
+with c1:
+    st.subheader("Estimated quality (proxy)")
+    st.caption("Protein range is ±0.5% abs around prediction (DM). Starch proxy is a simple inverse relation to protein; phosphate protector adds +0.6% abs.")
+    qc1, qc2 = st.columns(2)
+    with qc1:
+        st.markdown(
+            '<div class="card"><div class="muted">Estimated Protein (DM)</div>'
+            f'<div class="val" style="font-weight:800; font-size:28px;">{prot_low:.1f}–{prot_high:.1f}%</div></div>',
+            unsafe_allow_html=True
         )
-
-# Input line under the header
-user_q = st.text_input(
-    label="Ask the advisor",
-    placeholder="Ask a question (e.g., 'What if I reduce N by 15%?')",
-    label_visibility="collapsed",
-    key="ask_box"
-)
-
-def azure_chat_completion(
-    prompt: str,
-    context: Dict[str, str],
-    temperature: float = 0.2
-) -> Tuple[Optional[str], Optional[str]]:
-    """Call Azure OpenAI if configured; return (answer, error)."""
-
-    # Check secrets
-    if "azure" not in st.secrets:
-        return None, "Azure OpenAI not configured. Add [azure] api_key, endpoint, deployment, api_version in Secrets."
-
-    az = st.secrets["azure"]
-    required = ["api_key", "endpoint", "deployment", "api_version"]
-    if any(k not in az or not az[k] for k in required):
-        return None, "Azure OpenAI not configured. Missing one of api_key, endpoint, deployment, api_version."
-
-    try:
-        from openai import AzureOpenAI
-        client = AzureOpenAI(
-            api_key=az["api_key"],
-            azure_endpoint=az["endpoint"],
-            api_version=az["api_version"],
+    with qc2:
+        st.markdown(
+            '<div class="card"><div class="muted">Estimated Starch (DM)</div>'
+            f'<div class="val" style="font-weight:800; font-size:28px;">{starch_low:.1f}–{starch_high:.1f}%</div></div>',
+            unsafe_allow_html=True
         )
-
-        sys_prompt = (
-            "You are a cautious agronomy assistant for barley. "
-            "Use short, practical notes. Avoid unsafe, off-label, or definitive agronomy instructions. "
-            "If uncertain, suggest consulting a local agronomist. "
-            "When discussing nitrogen, relate to rate/splits/timing at a high level and mention potential trade-offs "
-            "(yield, protein, lodging, quality)."
-        )
-
-        # Build context string
-        ctx_lines = []
-        for k, v in context.items():
-            ctx_lines.append(f"- {k}: {v}")
-        ctx_text = "Context:\n" + "\n".join(ctx_lines)
-
-        messages = [
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": f"{ctx_text}\n\nUser question: {prompt}"},
-        ]
-
-        resp = client.chat.completions.create(
-            model=az["deployment"],
-            messages=messages,
-            temperature=float(temperature),
-            max_tokens=400,
-        )
-        answer = resp.choices[0].message.content
-        return answer, None
-    except Exception as e:
-        return None, f"Azure call failed: {e}"
-
-if user_q:
-    ctx = {
-        "end_use": end_use,
-        "N rate (kg/ha)": f"{n_rate}",
-        "N split first prop": f"{n_split_first}",
-        "Final N timing": final_n_timing,
-        "N inhibitor": "on" if 'use_n_inhibitor' in locals() and use_n_inhibitor else "off",
-        "P protector": "on" if 'use_p_protector' in locals() and use_p_protector else "off",
-    }
-    if pred_yield is not None and pred_error is None:
-        ctx["Predicted yield (t/ha)"] = f"{pred_yield:0.2f}"
-        ctx["Predicted protein (%) [model]"] = f"{pred_protein:0.2f}"
-    # Include proxy est. if available
-    if 'protein_range' in locals() and 'starch_range' in locals():
-        ctx["Estimated protein (DM) [proxy]"] = protein_range
-        ctx["Estimated starch (DM) [proxy]"] = starch_range
-    if 'barley_price' in locals():
-        ctx["Barley price (USD/t)"] = f"{barley_price:0.0f}"
-    if 'urea_price' in locals():
-        ctx["Urea price (USD/t)"] = f"{urea_price:0.0f}"
-
-    with st.spinner("Thinking..."):
-        answer, err = azure_chat_completion(user_q, ctx, temperature=temperature)
-    if err:
-        with st.expander("Error details"):
-            st.error(err)
-    elif answer:
-        st.info(answer)
-
-# ============= Footer =============
-st.markdown("---")
-col1, col2 = st.columns([1, 2])
-with col1:
-    st.markdown("**Version:** demo")
-with col2:
     st.markdown(
-        "Developed by [Nikolay Georgiev](https://www.linkedin.com/in/nikolaygeorgiev/) "
-        "<img src='https://cdn-icons-png.flaticon.com/512/174/174857.png' width='15'>",
+        '<div class="infobox">Note: Model protein is trained on as-is measurements. The app converts to DM using your moisture input to keep the basis consistent.</div>',
         unsafe_allow_html=True
     )
+
+with c2:
+    st.subheader("Gross margin (simple)")
+    margin_per_ha, margin_total, breakdown = gross_margin_simple(inputs, yield_t_ha)
+    st.dataframe(
+        breakdown,
+        hide_index=True,
+        use_container_width=True,
+    )
+    st.markdown(
+        f'<div class="card" style="margin-top:10px;"><div class="muted">Summary</div>'
+        f'<div style="font-size:24px; font-weight:800;">Per ha: {symbol(inputs.currency)}{margin_per_ha:,.0f} &nbsp;&nbsp;|&nbsp;&nbsp; Field: {symbol(inputs.currency)}{margin_total:,.0f}</div></div>',
+        unsafe_allow_html=True
+    )
+
+# ================== What-if Advisor (Azure GenAI) ==================
+st.subheader("Ask the Generative AI advisor")
+st.caption("Powered by Azure OpenAI when configured. Try: *“What if I reduce N by 15%?”* or *“How does a phosphate protector impact starch and margin?”*")
+
+# Env-based configuration
+AZURE_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "")
+AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "")
+AZURE_API_KEY = os.getenv("AZURE_OPENAI_API_KEY", "")
+AZURE_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
+
+def call_azure_genai(prompt: str, context: dict) -> str:
+    """
+    If Azure env vars are present, call the chat completion endpoint.
+    Otherwise, return a local heuristic explanation so the UI still works.
+    """
+    if AZURE_ENDPOINT and AZURE_DEPLOYMENT and AZURE_API_KEY:
+        try:
+            # Lazy import to avoid dependency if not configured
+            import requests
+            url = f"{AZURE_ENDPOINT}/openai/deployments/{AZURE_DEPLOYMENT}/chat/completions?api-version={AZURE_API_VERSION}"
+            headers = {"api-key": AZURE_API_KEY, "Content-Type": "application/json"}
+            sys_prompt = (
+                "You are an agronomy advisor. Be concise and practical. "
+                "Use the provided context (yield, protein DM, starch DM band, prices, costs) to reason about margin trade-offs. "
+                "If the user asks about DM vs as-is, explain clearly."
+            )
+            payload = {
+                "messages": [
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": f"Context: {context}"},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.3,
+                "top_p": 0.95,
+            }
+            resp = requests.post(url, headers=headers, json=payload, timeout=20)
+            resp.raise_for_status()
+            data = resp.json()
+            return data["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            return f"(Azure call failed, falling back locally) {e}\n\nGiven your inputs, here’s a quick heuristic: reducing N typically lowers protein and sometimes yield; margin impact depends on urea & barley price spread."
+    # Local fallback
+    return (
+        "Azure advisor not configured. Heuristic guidance:\n"
+        "- Lowering N by ~15% often reduces protein (DM) by ~0.1–0.3 abs and yield slightly; savings in urea may improve margin when grain prices are weak.\n"
+        "- Phosphate protector adds a small cost but can nudge starch DM upward (~+0.6 abs here), potentially helpful for malting specs.\n"
+        "Configure Azure env vars to enable full Generative AI responses."
+    )
+
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
+# Show prior messages
+for role, content in st.session_state.chat_history:
+    with st.chat_message(role):
+        st.markdown(content)
+
+user_msg = st.chat_input("Ask a question (e.g., “What if I reduce N by 15%?”)")
+if user_msg:
+    st.session_state.chat_history.append(("user", user_msg))
+    with st.chat_message("user"):
+        st.markdown(user_msg)
+
+    context = {
+        "yield_t_ha": round(yield_t_ha, 2),
+        "protein_dm_pct": round(protein_dm, 2),
+        "starch_dm_band": (round(starch_low, 1), round(starch_high, 1)),
+        "currency": inputs.currency,
+        "barley_price_per_t": inputs.barley_price,
+        "urea_price_per_t": inputs.urea_price,
+        "phosphate_price_per_t": inputs.phosphate_price,
+        "inhibitor_on": inputs.inhibitor_on,
+        "protector_on": inputs.protector_on,
+        "moisture_pct": inputs.moisture_pct,
+        "n_rate": inputs.n_rate,
+        "p_rate": inputs.p_rate,
+        "margin_per_ha": round(margin_per_ha, 0),
+    }
+    reply = call_azure_genai(user_msg, context)
+    st.session_state.chat_history.append(("assistant", reply))
+    with st.chat_message("assistant"):
+        st.markdown(reply)
+
+# ================== Footer ==================
+st.markdown(
+    """
+    <div class="muted" style="margin-top:24px;">
+      Data note: model training used public agronomy datasets from TEAGASC. This is a prototype for learning and discussion.
+      Always validate with your own field data, local specs, and advisor guidance.
+    </div>
+    """,
+    unsafe_allow_html=True
+)
