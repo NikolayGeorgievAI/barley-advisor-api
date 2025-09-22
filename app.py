@@ -94,36 +94,44 @@ else:
 
 # ---------- Predict ----------
 if st.button("Predict"):
-    try:
-        def to_scalar(v):
-            import numpy as np
-            # unwrap numpy array / list
-            if isinstance(v, (list, tuple, np.ndarray)):
-                if len(v) > 0:
-                    return to_scalar(v[0])
-                else:
-                    return None
-            return v
+    import numpy as np
 
-        row = []
+    def to_scalar(v):
+        """Force any input into a plain Python scalar or string."""
+        if isinstance(v, (list, tuple, np.ndarray)):
+            if len(v) == 0:
+                return None
+            return to_scalar(v[0])
+        return v
+
+    try:
+        clean_row = []
         for c in EXPECTED:
             v = user_vals.get(c)
-            v = to_scalar(v)
-            # force float if numeric-looking
+
+            v = to_scalar(v)  # flatten arrays/lists
+            # try float conversion if it looks numeric
             try:
                 v = float(v)
             except Exception:
+                # leave strings (categoricals) untouched
                 pass
-            row.append(v)
 
-        X = pd.DataFrame([row], columns=EXPECTED)
+            clean_row.append(v)
 
-        y = model.predict(X)[0]
+        X = pd.DataFrame([clean_row], columns=EXPECTED)
+
+        y = model.predict(X)
+        # y itself may be an array → unwrap
+        if isinstance(y, (list, tuple, np.ndarray)):
+            y = y[0]
+
         st.success(f"Predicted yield: **{float(y):.2f} t/ha**")
 
     except Exception as e:
         st.error("Prediction failed — see details below.")
         st.code(repr(e))
+
 
 
 
