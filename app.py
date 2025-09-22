@@ -94,37 +94,27 @@ else:
 
 # ---------- Predict ----------
 if st.button("Predict"):
-    def predict_with(df):
-        return model.predict(df)[0]
+    try:
+        # Build DataFrame in the exact expected order
+        row = []
+        for c in EXPECTED:
+            v = user_vals.get(c)
+            # force scalar
+            if isinstance(v, (list, tuple, np.ndarray)):
+                v = v[0]
+            try:
+                v = float(v)
+            except Exception:
+                pass
+            row.append(v)
 
-    # If we have an expected list, use it in that exact order
-    if EXPECTED:
-        X = pd.DataFrame([[user_vals.get(c, np.nan) for c in EXPECTED]], columns=EXPECTED)
-        try:
-            y = predict_with(X)
-            st.success(f"Predicted yield: **{float(y):.2f} t/ha**")
-        except Exception as e:
-            st.error("Prediction failed — see details below. I’ll try to infer any other required columns.")
-            st.code(repr(e))
-    else:
-        # try with what we have to get the model’s exact “missing columns” message
-        try:
-            X = pd.DataFrame([user_vals])
-            y = predict_with(X)
-            st.success(f"Predicted yield: **{float(y):.2f} t/ha**")
-        except Exception as e:
-            st.error("Model expects specific columns. I parsed the error below:")
-            msg = repr(e)
-            st.code(msg)
+        X = pd.DataFrame([row], columns=EXPECTED)
 
-            # Attempt to extract a set like: ("col1", "col2", ...)
-            m = re.search(r"Columns are missing:\s*\(([^)]*)\)", msg)
-            if m:
-                raw = m.group(1)
-                # split by quotes
-                missing = [c.strip().strip("'").strip('"') for c in raw.split(",") if c.strip().strip("'").strip('"')]
-                missing = [c for c in missing if c]  # clean
-                st.warning("Add these to your UI (I can do this automatically next edit):")
-                st.write(missing)
-            else:
-                st.info("Couldn’t parse missing columns list. Share the error above and I’ll wire them in.")
+        y = model.predict(X)[0]
+        st.success(f"Predicted yield: **{float(y):.2f} t/ha**")
+
+    except Exception as e:
+        st.error("Prediction failed — see details below.")
+        st.code(repr(e))
+
+
