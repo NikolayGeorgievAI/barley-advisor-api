@@ -293,11 +293,13 @@ else:
     st.info("Enter inputs and click **Predict** to see the gross margin KPIs.")
 
 # ============= Ask the advisor (Azure OpenAI) =============
-st.markdown('<div class="advisor-row"><div class="advisor-title">Ask the advisor</div>', unsafe_allow_html=True)
+st.markdown("## Ask the advisor")
 
-# Settings aligned to right of the header
-settings_col = st.columns([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1])[ -1 ]  # small trick to push right
-with settings_col:
+col_left, col_right = st.columns([3, 1])  # wide left, narrow right
+with col_left:
+    st.markdown("###")  # spacer so alignment is nice
+
+with col_right:
     with st.expander("Advisor settings (optional)", expanded=False):
         temperature = st.slider(
             "Response style",
@@ -305,10 +307,13 @@ with settings_col:
             help="AI generation setting (not weather): lower = more concise/grounded, higher = more exploratory."
         )
 
-st.markdown('</div>', unsafe_allow_html=True)
+# Input line under the header
+user_q = st.text_input(
+    "Ask a question (e.g., 'What if I reduce N by 15%?')",
+    label_visibility="collapsed",
+    key="ask_box"
+)
 
-# Input line
-user_q = st.text_input("Ask a question (e.g., 'What if I reduce N by 15%?')", label_visibility="collapsed", key="ask_box")
 
 def azure_chat_completion(
     prompt: str,
@@ -404,3 +409,4 @@ with footer_cols[-1]:
         """,
         unsafe_allow_html=True
     )
+
