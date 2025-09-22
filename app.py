@@ -1,39 +1,38 @@
-import os
+# app.py — Barley Advisor (predictor + recommendations + Azure advisor chat)
 import json
 from pathlib import Path
+
+import joblib
 import numpy as np
 import pandas as pd
-import joblib
 import streamlit as st
 
-# ---------- UI BASICS ----------
+# ---------------- Page setup ----------------
 st.set_page_config(page_title="Barley Advisor — Yield & Quality", page_icon="🌾", layout="wide")
-
 st.markdown(
     "<h1 style='margin-bottom:0'>🌾 Barley Advisor — Yield & Quality</h1>"
-    "<div style='color:#666;margin-top:4px'>Prototype model trained on Teagasc dataset. "
+    "<div style='color:#666;margin-top:4px'>Prototype model trained on Teagasc data. "
     "For demo only — not agronomic advice.</div>",
     unsafe_allow_html=True,
 )
 
-# ---------- MODEL LOADING ----------
+# ---------------- Model loading ----------------
 MODEL_PATH = Path("barley_model/model.pkl")
 
 @st.cache_resource(show_spinner=False)
 def load_model():
     if not MODEL_PATH.exists():
         raise FileNotFoundError(f"Could not find model at {MODEL_PATH}")
-    model = joblib.load(MODEL_PATH)
-    return model
+    return joblib.load(MODEL_PATH)
 
-model_error = None
 model = None
+model_error = None
 try:
     model = load_model()
 except Exception as e:
     model_error = str(e)
 
-# Expected feature order used during training
+# Expected column order for your pipeline
 FEATURE_ORDER = [
     "source_doc",
     "year",
@@ -44,103 +43,180 @@ FEATURE_ORDER = [
     "final_n_timing_gs",
 ]
 
-# For clean UX in the main column
-col_main, = st.columns([1])
+# ---------------- Inputs & Prediction ----------------
+st.subheader("Inputs")
 
-# ---------- INPUTS / PREDICTION ----------
-with st.container():
-    st.subheader("Inputs")
+# Hidden defaults (kept out of the UI for end users)
+SOURCE_DOC_DEFAULT = "Focus2022"
+SITE_ID_DEFAULT = "S1"
 
-    # Keep “hidden” source_doc for consistency with trained pipeline (we set Focus2022)
-    source_doc_default = "Focus2022"  # safest default from your inspection
-    source_doc = source_doc_default
+# Friendly GS mapping (UI ←→ model code)
+GS_OPTIONS = {
+    "GS25": "Tillering (GS25)",
+    "GS31": "Stem elongation (GS31)",
+    "GS37": "Flag leaf visible (GS37)",
+    "GS61": "Flowering (GS61)",
+    "emergence": "Emergence",
+    "sowing": "At sowing",
+}
+GS_LABELS = [GS_OPTIONS[k] for k in GS_OPTIONS]
+INV_GS = {v: k for k, v in GS_OPTIONS.items()}
 
-    # End-use choices (align with your encoder categories)
-    END_USE = ["feed", "malting"]
-    # GS milestones translated to friendly labels (keep original codes for model)
-    GS_OPTIONS = {
-        "GS25": "Tillering (GS25)",
-        "GS31": "Stem elongation (GS31)",
-        "GS55": "Ear half-emerged (GS55)",
-        "GS57": "Ear three-quarters (GS57)",
-        "GS61": "Flowering (GS61)",
-        "emergence": "Emergence",
-        "sowing": "Sowing",
+END_USE = ["feed", "malting"]
+
+c1, c2 = st.columns(2)
+with c1:
+    year = st.number_input("Year", value=2020, min_value=2010, max_value=2035, step=1,
+                           help="Trial/season year.")
+    n_rate = st.number_input("Nitrogen rate (kg/ha)", value=120.0, min_value=0.0, max_value=300.0, step=1.0,
+                             help="Total N applied across the season.")
+    gs_label = st.selectbox("Final N timing", options=GS_LABELS, index=GS_LABELS.index("Tillering (GS25)"),
+                            help="Growth stage of the **final** N application (Zadoks).")
+with c2:
+    end_use = st.selectbox("End use", END_USE, index=END_USE.index("feed"),
+                           help="Intended grain use.")
+    n_split_first_prop = st.number_input("N split — first application proportion",
+                                         value=0.50, min_value=0.0, max_value=1.0, step=0.05,
+                                         help="Share of total N applied in the first split (0–1).")
+
+# Prepare input row (respecting model feature order)
+def make_input_df():
+    row = {
+        "source_doc": SOURCE_DOC_DEFAULT,
+        "year": int(year),
+        "site_id": SITE_ID_DEFAULT,
+        "end_use": end_use,
+        "n_rate_kg_ha": float(n_rate),
+        "n_split_first_prop": float(n_split_first_prop),
+        "final_n_timing_gs": INV_GS[gs_label],
     }
-    gs_labels = [GS_OPTIONS[k] for k in GS_OPTIONS]
+    return pd.DataFrame([{k: row[k] for k in FEATURE_ORDER}])
 
-    c1, c2 = st.columns(2)
-    with c1:
-        year = st.number_input("Year", value=2020, min_value=2010, max_value=2035, step=1)
-        n_rate = st.number_input("Nitrogen rate (kg/ha)", value=120.0, min_value=0.0, max_value=300.0, step=1.0)
-        gs_label = st.selectbox("Final N timing", options=gs_labels, index=list(GS_OPTIONS.keys()).index("GS25"))
-    with c2:
-        end_use = st.selectbox("End use", END_USE, index=END_USE.index("feed"))
-        n_split_first_prop = st.number_input("N split — first application proportion", value=0.50, min_value=0.0, max_value=1.0, step=0.05)
+pred_df = make_input_df()
 
-    # We hide site_id for users; pick a stable default used during training (e.g., “S1”/“A”/etc.)
-    site_id = "S1"
+predict_btn = st.button("Predict", type="primary")
+pred_yield = None
+pred_protein = None
 
-    # Map label back to code
-    inverse_gs = {v: k for k, v in GS_OPTIONS.items()}
-    final_n_timing_gs = inverse_gs[gs_label]
+if predict_btn:
+    if model_error:
+        st.error(f"Model error: {model_error}")
+    else:
+        try:
+            raw = model.predict(pred_df)
+            raw = np.array(raw).reshape(-1)
+            if raw.size >= 2:
+                pred_yield = float(raw[0])
+                pred_protein = float(raw[1])
+                c_y, c_p = st.columns(2)
+                c_y.success(f"**Predicted yield:** {pred_yield:.2f} t/ha")
+                c_p.success(f"**Predicted grain protein:** {pred_protein:.2f} %")
+            else:
+                pred_yield = float(raw[0])
+                st.success(f"**Predicted yield:** {pred_yield:.2f} t/ha")
+                st.info("Model returned a single target.")
+            st.caption("Results are model estimates based on the inputs provided.")
+            st.session_state["last_prediction"] = {
+                "yield_t_ha": pred_yield,
+                "protein_pct": pred_protein,
+                "inputs": pred_df.to_dict(orient="records")[0],
+            }
+        except Exception as e:
+            st.error("Prediction failed — check inputs/categories.")
+            st.code(repr(e), language="text")
 
-    def make_input_df():
-        row = {
-            "source_doc": source_doc,
-            "year": int(year),
-            "site_id": site_id,
-            "end_use": end_use,
-            "n_rate_kg_ha": float(n_rate),
-            "n_split_first_prop": float(n_split_first_prop),
-            "final_n_timing_gs": final_n_timing_gs,
-        }
-        # Ensure exact column order the pipeline expects
-        df = pd.DataFrame([{k: row[k] for k in FEATURE_ORDER}])
-        return df
+# ---------------- Recommendation engine (rule-based) ----------------
+def simple_recommendation(end_use: str, n_rate: float, n_split_first: float, final_gs: str,
+                          y_pred: float | None, p_pred: float | None) -> str:
+    """
+    Transparent heuristics:
+      - Malting protein window ~9.5–11.0%.
+      - If protein > 11: reduce N by ~5–20% and/or earlier final timing.
+      - If protein < 9.5: increase N by ~5–20% and/or slightly later timing.
+      - Feed: prioritize yield and N efficiency.
+    """
+    lines = []
+    if y_pred is not None:
+        lines.append(f"Predicted yield: {y_pred:.2f} t/ha.")
+    if p_pred is not None:
+        lines.append(f"Predicted protein: {p_pred:.2f}%.")
 
-    pred_df = make_input_df()
-
-    predict_btn = st.button("Predict", type="primary", use_container_width=False)
-
-    last_prediction = None
-    if predict_btn:
-        if model_error:
-            st.error(f"Model error: {model_error}")
+    if end_use == "malting" and p_pred is not None:
+        lo, hi = 9.5, 11.0
+        if p_pred > hi:
+            overshoot = min(max((p_pred - hi) / 2.0, 0.05), 0.20)  # 5–20%
+            kgha = int(round(n_rate * overshoot))
+            lines.append(
+                f"Protein is above malting target ({lo}–{hi}%). "
+                f"Consider **reducing total N by ~{int(overshoot*100)}% (~{kgha} kg/ha)**."
+            )
+            if final_gs in ["GS37", "GS61"]:
+                lines.append("Consider **earlier final N timing** (e.g., GS25–GS31) to reduce late protein uplift.")
+        elif p_pred < lo:
+            undershoot = min(max((lo - p_pred) / 2.0, 0.05), 0.20)
+            kgha = int(round(n_rate * undershoot))
+            lines.append(
+                f"Protein is below malting target. "
+                f"Consider **increasing total N by ~{int(undershoot*100)}% (~{kgha} kg/ha)**."
+            )
+            if final_gs in ["sowing", "emergence", "GS25"]:
+                lines.append("A **slightly later final N timing** (e.g., GS31) can help lift protein.")
         else:
-            try:
-                raw = model.predict(pred_df)  # expecting [yield_t_ha, protein_pct] or similar
-                raw = np.array(raw).reshape(-1)
-                # Heuristic mapping; adjust if your pipeline returns named outputs
-                if raw.size == 2:
-                    yld, prot = float(raw[0]), float(raw[1])
-                else:
-                    # If model returns e.g. dict or 2D, try best-effort:
-                    yld, prot = float(raw[0]), float(raw[1]) if raw.size > 1 else (float(raw[0]), np.nan)
+            lines.append("Protein is within the typical malting window — consider **fine-tuning splits** rather than total N.")
+            if 0.35 <= n_split_first <= 0.55:
+                lines.append("First-split share looks balanced for malting (~40–50%).")
+    else:
+        # feed use
+        if y_pred is not None and y_pred < 7.0 and n_rate < 150:
+            lines.append("Yield looks modest; consider **raising N** toward 150–180 kg/ha if soil N is low.")
+        if final_gs in ["sowing", "emergence"]:
+            lines.append("Avoid concentrating too much N at sowing; ensure **in-season splits** (GS25/GS31).")
 
-                st.success(f"**Predicted yield:** {yld:.2f} t/ha")
-                st.success(f"**Predicted grain protein:** {prot:.2f} %")
-                last_prediction = {
-                    "yield_t_ha": yld,
-                    "protein_pct": prot,
-                    "inputs": pred_df.to_dict(orient="records")[0],
-                }
-                st.session_state["last_prediction"] = last_prediction
-            except Exception as e:
-                st.error("Prediction failed — check feature inputs or categories.")
-                st.code(repr(e), language="text")
+    lines.append("Always adjust for local soil N, previous crop, lodging risk, and regulations.")
+    return " ".join(lines)
 
-# ---------- ADVISOR (Azure OpenAI) ----------
+if "last_prediction" in st.session_state:
+    lp = st.session_state["last_prediction"]
+    rec_text = simple_recommendation(
+        end_use=end_use,
+        n_rate=float(n_rate),
+        n_split_first=float(n_split_first_prop),
+        final_gs=INV_GS[gs_label],
+        y_pred=lp.get("yield_t_ha"),
+        p_pred=lp.get("protein_pct"),
+    )
+    st.markdown("### 📋 Recommendation")
+    st.info(rec_text)
+
+# ---------------- Advisor (Azure OpenAI) ----------------
 st.markdown("---")
-st.subheader("Ask the advisor")
 
-# Small helper to read Azure secrets safely (unchanged)
+# Header row: left title, right settings on the SAME line
+col_left, col_right = st.columns([3, 1], vertical_alignment="center")
+with col_left:
+    st.subheader("Ask the advisor")
+with col_right:
+    with st.expander("Advisor settings", expanded=False):
+        if "advisor_tone" not in st.session_state:
+            st.session_state.advisor_tone = "Concise"
+        if "advisor_use_context" not in st.session_state:
+            st.session_state.advisor_use_context = True
+        st.session_state.advisor_use_context = st.checkbox(
+            "Include prediction context",
+            value=st.session_state.advisor_use_context,
+        )
+        st.session_state.advisor_tone = st.selectbox(
+            "Tone", ["Concise", "Detailed"],
+            index=0 if st.session_state.advisor_tone == "Concise" else 1,
+        )
+
+# Helper: read Azure secrets safely
 def read_azure_secrets():
     data = st.secrets.get("azure", {})
     key = data.get("api_key") or data.get("key")
     endpoint = (data.get("endpoint") or "").rstrip("/")
     deployment = data.get("deployment")
-    api_version = data.get("api_version") or data.get("version") or "2024-02-15-preview"
+    api_version = data.get("api_version") or "2024-08-01-preview"
     return key, endpoint, deployment, api_version
 
 azure_key, azure_endpoint, azure_deployment, azure_api_version = read_azure_secrets()
@@ -152,151 +228,125 @@ def azure_configured() -> bool:
     if not azure_deployment: missing.append("azure.deployment")
     if not azure_api_version:missing.append("azure.api_version")
     if missing:
-        st.info(
-            ":orange[Azure OpenAI not configured] — add " + ", ".join(missing) +
-            " in **Streamlit → Settings → Secrets** to enable the chatbot."
-        )
+        st.info(":orange[Azure OpenAI not configured] — add "
+                + ", ".join(missing)
+                + " in **Streamlit → Settings → Secrets** to enable the advisor.")
         return False
     return True
 
-# Layout: left = chat (immediately after predictions), right = advisor settings
-left_col, right_col = st.columns([3, 1], vertical_alignment="top")
-
-# ---- RIGHT: settings (narrow) ------------------------------------------------
-with right_col:
-    # Optional sticky effect for the right column (stays visible while scrolling)
-    st.markdown(
-        """
-        <style>
-        .sticky-box {position: sticky; top: 90px;}
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-    with st.container():
-        st.markdown("<div class='sticky-box'>", unsafe_allow_html=True)
-
-        with st.expander("Advisor settings (optional)", expanded=False):
-            # session settings
-            if "advisor_tone" not in st.session_state:
-                st.session_state.advisor_tone = "Concise"
-            if "advisor_use_context" not in st.session_state:
-                st.session_state.advisor_use_context = True
-
-            st.session_state.advisor_use_context = st.checkbox(
-                "Include my latest prediction & inputs as context",
-                value=st.session_state.advisor_use_context,
-            )
-            st.session_state.advisor_tone = st.selectbox(
-                "Tone",
-                ["Concise", "Detailed"],
-                index=0 if st.session_state.advisor_tone == "Concise" else 1,
-            )
-        st.markdown("</div>", unsafe_allow_html=True)
-
-# ---- LEFT: chat area ---------------------------------------------------------
-with left_col:
-    # Initialize chat memory
-    if "chat_messages" not in st.session_state:
-        st.session_state.chat_messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are Barley Advisor, a helpful agronomy assistant. "
-                    "Provide practical, cautious guidance for spring barley in temperate climates. "
-                    "Use simple language and actionable steps. "
-                    "Never claim certainty; recommend consulting local agronomy guidance."
-                ),
-            }
-        ]
-
-    # Helper to add contextual system message (prediction + inputs)
-    def add_context_message():
-        lp = st.session_state.get("last_prediction")
-        if not lp:
-            return None
-        ctx = {
-            "predicted_yield_t_ha": lp.get("yield_t_ha"),
-            "predicted_protein_pct": lp.get("protein_pct"),
-            "inputs": lp.get("inputs"),
-        }
-        return {
+# Initialize chat history (session memory)
+if "chat_messages" not in st.session_state:
+    st.session_state.chat_messages = [
+        {
             "role": "system",
             "content": (
-                "Context from the prediction tool (if available). "
-                f"JSON: {json.dumps(ctx)}. "
-                "Use this to tailor recommendations (e.g., protein high for malting)."
+                "You are Barley Advisor, a helpful agronomy assistant for spring barley. "
+                "Context is agronomy only; no unsafe intent. "
+                "Be practical, cautious, and clear. If suggesting N changes, keep to ±10–20% with caveats "
+                "about soil N, regulations, lodging risk, and timing."
             ),
         }
+    ]
 
-    # Render history
-    for m in st.session_state.chat_messages:
-        if m["role"] == "user":
-            st.chat_message("user").markdown(m["content"])
-        elif m["role"] == "assistant":
-            st.chat_message("assistant").markdown(m["content"])
+# Helper: optional context message from prediction
+def build_context_message():
+    lp = st.session_state.get("last_prediction")
+    if not lp:
+        return None
+    ctx = {
+        "predicted_yield_t_ha": lp.get("yield_t_ha"),
+        "predicted_protein_pct": lp.get("protein_pct"),
+        "inputs": lp.get("inputs"),
+        "guidance": {
+            "malting_protein_target": "9.5–11.0%",
+            "typical_first_split_share": "40–50%",
+            "gs_notes": "GS25=tillering, GS31=stem elongation, GS37=flag leaf, GS61=flowering",
+        },
+    }
+    return {"role": "system", "content": f"Prediction context (JSON): {json.dumps(ctx)}"}
 
-    # Chat input directly under predictions
-    prompt = st.chat_input("Ask a question (e.g., “What if I reduce N by 15%?”)")
-    if prompt:
-        st.session_state.chat_messages.append({"role": "user", "content": prompt})
-        st.chat_message("user").markdown(prompt)
+# Render chat history so far
+for m in st.session_state.chat_messages:
+    if m["role"] == "user":
+        st.chat_message("user").markdown(m["content"])
+    elif m["role"] == "assistant":
+        st.chat_message("assistant").markdown(m["content"])
 
-        if not azure_configured():
-            st.stop()
+# Chat input (immediately under advisor header)
+user_prompt = st.chat_input("Ask a question (e.g., 'What if I reduce N by 15%?')")
+if user_prompt:
+    st.session_state.chat_messages.append({"role": "user", "content": user_prompt})
+    st.chat_message("user").markdown(user_prompt)
 
-        # Build request with optional context
-        messages = list(st.session_state.chat_messages)
-        if st.session_state.advisor_use_context:
-            ctx_msg = add_context_message()
-            if ctx_msg:
-                messages.insert(1, ctx_msg)
+    if not azure_configured():
+        st.stop()
 
-        try:
-            from openai import AzureOpenAI
-            client = AzureOpenAI(
-                api_key=azure_key,
-                api_version=azure_api_version,
-                azure_endpoint=azure_endpoint,
-            )
-            temp = 0.2 if st.session_state.advisor_tone == "Concise" else 0.5
-            resp = client.chat.completions.create(
-                model=azure_deployment,
-                messages=messages,
-                temperature=temp,
-                max_tokens=500,
-            )
-            answer = resp.choices[0].message.content if resp and resp.choices else "I couldn’t generate a response."
-            st.session_state.chat_messages.append({"role": "assistant", "content": answer})
-            st.chat_message("assistant").markdown(answer)
+    messages = list(st.session_state.chat_messages)
+    if st.session_state.advisor_use_context:
+        ctx_msg = build_context_message()
+        if ctx_msg:
+            messages.insert(1, ctx_msg)
 
-        except Exception as e:
-            msg = str(e)
+    try:
+        from openai import AzureOpenAI
+
+        client = AzureOpenAI(
+            api_key=azure_key,
+            api_version=azure_api_version,
+            azure_endpoint=azure_endpoint,
+        )
+
+        temperature = 0.2 if st.session_state.advisor_tone == "Concise" else 0.5
+        resp = client.chat.completions.create(
+            model=azure_deployment,  # this is the Deployment name in Azure
+            messages=messages,
+            temperature=temperature,
+            max_tokens=600,
+        )
+        answer = resp.choices[0].message.content if resp and resp.choices else "I couldn't generate a response."
+        st.session_state.chat_messages.append({"role": "assistant", "content": answer})
+        st.chat_message("assistant").markdown(answer)
+
+    except Exception as e:
+        msg = str(e)
+        if "filtered" in msg.lower():
+            st.warning("⚠️ Your question was blocked by Azure’s safety filters. Try rephrasing in agronomy terms (e.g., 'Effect of raising nitrogen by 15% on yield/protein').")
+        else:
             hint = ""
             if "401" in msg or "Access denied" in msg:
-                hint = "Check API key & subscription; ensure endpoint region matches deployment."
+                hint = "Check API key & subscription; ensure endpoint region matches your deployment."
             elif "404" in msg:
                 hint = "Verify the `deployment` name in secrets matches your Azure OpenAI Deployment."
             elif "Name or service not known" in msg or "ENOTFOUND" in msg:
                 hint = "Endpoint may be wrong. It should look like https://<resource>.openai.azure.com/"
             elif "429" in msg:
-                hint = "Possible rate limiting; try again shortly."
-
-            st.warning("Azure call failed. " + (hint or "See error details below."))
+                hint = "You may be rate-limited. Try again shortly."
+            st.warning("Azure call failed. " + (hint or "See details below."))
             with st.expander("Error details"):
                 st.code(msg, language="text")
-# Footer
+
+# ---------------- Optional safe debug (no secrets printed) ----------------
+with st.expander("Debug (safe)"):
+    try:
+        import importlib.metadata as md
+        st.write("openai version:", md.version("openai"))
+    except Exception as e:
+        st.write("openai import failed:", e)
+    st.write("[azure] in secrets:", "azure" in st.secrets)
+    if "azure" in st.secrets:
+        st.write("azure keys present:", sorted(list(st.secrets["azure"].keys())))
+
+# ---------------- Footer ----------------
 st.markdown(
     """
     <hr style="margin-top: 2em; margin-bottom: 1em;">
     <div style="text-align: center; color: grey; font-size: 0.9em;">
         Developed by 
         <a href="https://www.linkedin.com/in/nikolaygeorgiev/" target="_blank" style="color: grey; text-decoration: none;">
-            <img src="https://cdn-icons-png.flaticon.com/512/174/174857.png" width="16" style="vertical-align: middle; margin-right: 4px;">
             <b>Nikolay Georgiev</b>
+            <img src="https://cdn-icons-png.flaticon.com/512/174/174857.png" width="16" style="vertical-align: middle; margin-left: 6px;">
         </a>
     </div>
     """,
     unsafe_allow_html=True,
 )
-
