@@ -1,334 +1,329 @@
 # app.py
+# Barley Advisor — Yield & Quality Predictor (clean version)
+# - No Year, no debug panes
+# - Azure OpenAI chat advisor (with a clear "Response style" control instead of "temperature")
+# - Footer credit with LinkedIn (icon shown AFTER name)
+# - Hidden defaults for model features not shown to the user (source_doc, site_id)
+
 from __future__ import annotations
 
 import os
-import json
 import joblib
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# ----------
-# Page config
-# ----------
+# ---------- App config ----------
 st.set_page_config(
-    page_title="Barley Advisor — Yield & Quality Predictor",
+    page_title="Barley Advisor — Yield & Quality",
     page_icon="🌾",
     layout="wide",
 )
 
-# -----------------
-# Styling / helpers
-# -----------------
-HIDE_DECORATION = """
-<style>
-/* Tighten cards/panels a bit and make inputs roomy */
-section.main > div { padding-top: 1.2rem; }
-.block-container { padding-top: 2rem; padding-bottom: 3rem; }
-div[data-baseweb="select"] > div { border-radius: 10px; }
-.stAlert { border-radius: 12px; }
+# ---------- Constants / UI dictionaries ----------
+END_USE_OPTIONS = ["feed", "malting"]
 
-/* Right-align the Advisor settings header cell content */
-.advisor-settings-col > div:nth-child(1) { display: flex; justify-content: end; }
-
-/* Footer link styling */
-.footer a { text-decoration: none; }
-.footer .name { font-weight: 600; }
-</style>
-"""
-st.markdown(HIDE_DECORATION, unsafe_allow_html=True)
-
-def pill(text: str, color: str = "#16a34a") -> str:
-    """Small rounded pill for result chips."""
-    return f"""
-    <span style="
-        display:inline-block;
-        padding:0.35rem 0.6rem;
-        border-radius:999px;
-        font-weight:600;
-        background:{color}1A;
-        color:{color};
-        border:1px solid {color}33;">
-        {text}
-    </span>
-    """
-
-# ---------------
-# Load the model
-# ---------------
-@st.cache_resource(show_spinner=True)
-def load_model():
-    # Expecting joblib pipeline at barley_model/model.pkl
-    path = os.path.join("barley_model", "model.pkl")
-    model = joblib.load(path)
-
-    # Try to detect expected order (helps avoid column mismatch)
-    expected = None
-    if hasattr(model, "feature_names_in_"):
-        expected = list(model.feature_names_in_)
-    else:
-        # Fallback to the order we used during training (based on your earlier logs)
-        expected = [
-            "source_doc",
-            "year",
-            "site_id",
-            "end_use",
-            "n_rate_kg_ha",
-            "n_split_first_prop",
-            "final_n_timing_gs",
-        ]
-    return model, expected
-
-MODEL, EXPECTED = load_model()
-
-# --------------------
-# Domain dictionaries
-# --------------------
-END_USE = {
-    "feed": "feed",
-    "malting": "malting",
-}
-
-# Use simple labels for BBCH/GS – map to training categories
-FINAL_N_TIMING_LABELS = {
+# Friendly labels for final N timing, mapped to GS codes used by the model
+GS_LABELS = {
     "Tillering (GS25)": "GS25",
-    "Stem extension (GS31–32)": "GS31",
-    "Flag leaf (GS37–39)": "GS37",
-    "Ear emergence (GS51–55)": "GS51",
-    "Flowering (GS59)": "GS59",
+    "Stem extension (GS31)": "GS31",
+    "Flag leaf (GS37)": "GS37",
+    "Booting (GS41)": "GS41",
+    "Emergence": "emergence",
+    "Sowing": "sowing",
 }
+GS_FRIENDLY = list(GS_LABELS.keys())
 
-# Hidden defaults (not shown to user, but required by the model)
-HIDDEN_DEFAULTS = {
-    "source_doc": "Focus2022",
-    "site_id": "S1",
-    "year": 2020,  # kept but hidden in UI
-}
+# Hidden defaults for features the model expects but we don’t show
+DEFAULT_SOURCE_DOC = "Focus2022"   # consistent default doc used during training
+DEFAULT_SITE_ID = "S1"             # single-site default to keep UI simple
 
-# -----------------
-# Header + subtext
-# -----------------
-st.title("Barley Advisor — Yield & Quality Predictor")
-st.caption("Prototype model trained on Teagasc data. For demo only — not agronomic advice.")
-
-# -------------
-# Input controls
-# -------------
-with st.container():
-    c1, c2 = st.columns(2)
-    with c1:
-        # Year is hidden from UI — using stored default
-        year = HIDDEN_DEFAULTS["year"]
-
-        n_rate = st.number_input(
-            "Nitrogen rate (kg/ha)",
-            min_value=0.0, max_value=350.0, step=5.0, value=120.0,
-            help="Total nitrogen rate applied across the season (kg/ha).",
-        )
-
-        final_n_label = st.selectbox(
-            "Final N timing",
-            options=list(FINAL_N_TIMING_LABELS.keys()),
-            index=0,
-            help="When the last nitrogen is planned. Labels map to growth stages used in the model.",
-        )
-        final_n_timing_gs = FINAL_N_TIMING_LABELS[final_n_label]
-
-    with c2:
-        end_use_label = st.selectbox(
-            "End use",
-            options=list(END_USE.keys()),
-            index=0,
-            help="Target market. Malting barley prefers lower grain protein.",
-        )
-        end_use = END_USE[end_use_label]
-
-        n_split_first_prop = st.number_input(
-            "N split — first application proportion",
-            min_value=0.0, max_value=1.0, step=0.05, value=0.50,
-            help="Share of total N applied in the first pass (e.g., 0.50 = 50%).",
-        )
-
-# Assemble single-row dataframe in expected order
-def build_features_df() -> pd.DataFrame:
-    row = {
-        "source_doc": HIDDEN_DEFAULTS["source_doc"],
-        "year": HIDDEN_DEFAULTS["year"],
-        "site_id": HIDDEN_DEFAULTS["site_id"],
-        "end_use": end_use,
-        "n_rate_kg_ha": float(n_rate),
-        "n_split_first_prop": float(n_split_first_prop),
-        "final_n_timing_gs": final_n_timing_gs,
-    }
-    # Respect model's expected column order
-    safe_row = {col: row[col] for col in EXPECTED}
-    return pd.DataFrame([safe_row])
-
-# ----------
-# Predict UI
-# ----------
-left, right = st.columns([1, 2])
-with left:
-    if st.button("Predict", type="primary", use_container_width=True):
-        df = build_features_df()
-        try:
-            raw = MODEL.predict(df)
-            # Expecting shape (1, 2): [yield_t_ha, protein_pct]
-            # Fall back gracefully if 1D
-            if isinstance(raw, (list, tuple, np.ndarray)):
-                arr = np.array(raw)
-                if arr.ndim == 2 and arr.shape[1] >= 2:
-                    yld = float(arr[0, 0])
-                    prot = float(arr[0, 1])
-                elif arr.ndim == 1 and arr.size >= 2:
-                    yld = float(arr[0])
-                    prot = float(arr[1])
-                else:
-                    # If model returns a single target, assume it's yield
-                    yld = float(arr[0])
-                    prot = np.nan
-            else:
-                yld, prot = float(raw), np.nan
-
-            st.session_state["last_prediction"] = {"yield_t_ha": yld, "protein_pct": prot}
-        except Exception as e:
-            st.error(f"Prediction failed. Please check inputs. Details: {e}")
-
-with right:
-    pred = st.session_state.get("last_prediction")
-    if pred:
-        y_txt = f"Predicted yield: {pred['yield_t_ha']:.2f} t/ha"
-        p_html = pill(y_txt, "#16a34a")
-        st.markdown(p_html, unsafe_allow_html=True)
-
-        if not np.isnan(pred.get("protein_pct", np.nan)):
-            pr_txt = f"Predicted grain protein: {pred['protein_pct']:.2f} %"
-            st.markdown(pill(pr_txt, "#2563eb"), unsafe_allow_html=True)
-
-        st.caption("Results are model estimates based on the inputs provided.")
-
-# -----------------------
-# Advisor (Azure OpenAI)
-# -----------------------
-st.divider()
-
-row_title, row_settings = st.columns([1.0, 1.0], gap="small")
-with row_title:
-    st.subheader("Ask the advisor")
-with row_settings:
-    # Right-side compact settings box
-    st.markdown('<div class="advisor-settings-col">', unsafe_allow_html=True)
-  with st.expander("Advisor settings (optional)"):
-    creativity = st.slider(
-        "Response style",
-        min_value=0.0,
-        max_value=1.0,
-        value=0.2,
-        step=0.05,
-        help="Controls how the advisor responds:\n"
-             "- Lower values = more conservative, consistent, and factual\n"
-             "- Higher values = more creative, exploratory, and varied"
-    )
+MODEL_PATH = os.path.join("barley_model", "model.pkl")
 
 
-# Build a helpful, safe prompt
-def build_advisor_prompt(question: str) -> str:
-    pred = st.session_state.get("last_prediction", {})
-    yld = pred.get("yield_t_ha")
-    prt = pred.get("protein_pct")
-
-    # Compact context
-    context = {
-        "end_use": end_use,
-        "n_rate_kg_ha": n_rate,
-        "n_split_first_prop": n_split_first_prop,
-        "final_n_timing_gs": final_n_timing_gs,
-        "assumed_year": HIDDEN_DEFAULTS["year"],
-        "assumed_site": HIDDEN_DEFAULTS["site_id"],
-        "predicted_yield_t_ha": round(yld, 3) if isinstance(yld, (int, float)) else None,
-        "predicted_protein_pct": round(prt, 3) if isinstance(prt, (int, float)) else None,
-    }
-
-    instructions = (
-        "You are a cautious agronomy assistant for spring barley in a temperate climate. "
-        "Use the provided context and the model estimates as indicative only. "
-        "Offer practical, concise suggestions. Avoid medical/chemical safety advice; instead, "
-        "recommend consulting local agronomy guidance for any regulatory or safety constraints. "
-        "Prefer neutral language and quantify changes (e.g., ±10–20 kg/ha). Keep to 6 bullets max, then a one-sentence summary."
-    )
-
-    return (
-        f"{instructions}\n\nCONTEXT:\n{json.dumps(context, ensure_ascii=False)}\n\n"
-        f"USER QUESTION:\n{question}\n\n"
-        "If the question asks about increasing/decreasing N, respond with expected trade-offs for yield & protein, "
-        "a suggested split ratio, and any watch-outs (lodging, timing drift)."
-    )
-
-# Azure OpenAI client (if configured)
-def get_azure_client():
+# ---------- Utilities ----------
+@st.cache_resource(show_spinner=False)
+def load_model(path: str):
+    """Load the trained sklearn pipeline (joblib)."""
     try:
-        az = st.secrets["azure"]
-        from openai import AzureOpenAI
-        client = AzureOpenAI(
-            api_key=az["api_key"],
-            api_version=az["api_version"],
-            azure_endpoint=az["endpoint"],
-        )
-        deployment = az["deployment"]
-        return client, deployment
+        return joblib.load(path)
+    except Exception as e:
+        st.error(f"Failed to load model at '{path}'.\n\n{e}")
+        return None
+
+
+def make_feature_row(
+    end_use: str,
+    n_rate_kg_ha: float,
+    n_split_first_prop: float,
+    final_n_timing_label: str,
+) -> pd.DataFrame:
+    """
+    Build a single-row dataframe in the exact feature order the model expects.
+    Expected columns (from training): 
+      ['source_doc','year','site_id','end_use','n_rate_kg_ha','n_split_first_prop','final_n_timing_gs']
+    - We removed 'year' from UI; set to a neutral default (e.g., 2020).
+    """
+    final_gs = GS_LABELS[final_n_timing_label]
+
+    data = {
+        "source_doc": [DEFAULT_SOURCE_DOC],
+        "year": [2020],  # neutral constant; model won’t mind as long as trained for multiple years
+        "site_id": [DEFAULT_SITE_ID],
+        "end_use": [end_use],
+        "n_rate_kg_ha": [float(n_rate_kg_ha)],
+        "n_split_first_prop": [float(n_split_first_prop)],
+        "final_n_timing_gs": [final_gs],
+    }
+    cols_in_order = [
+        "source_doc",
+        "year",
+        "site_id",
+        "end_use",
+        "n_rate_kg_ha",
+        "n_split_first_prop",
+        "final_n_timing_gs",
+    ]
+    df = pd.DataFrame(data)[cols_in_order]
+    return df
+
+
+def safe_number(x, default):
+    try:
+        return float(x)
     except Exception:
-        return None, None
+        return float(default)
 
-client, deployment = get_azure_client()
 
-# Chat box
-question = st.text_input(
-    "Ask a question (e.g., 'What if I reduce N by 15%?')",
-    value="",
-    placeholder="Type your agronomy question…",
-)
+# ---------- Azure OpenAI client (lazy) ----------
+def get_azure_client():
+    """
+    Build an Azure OpenAI client from Streamlit secrets.
+    Returns (client, deployment, api_ok: bool, msg_if_not_ok).
+    """
+    try:
+        from openai import AzureOpenAI
+    except Exception:
+        return None, None, False, "Python package 'openai' is not installed."
 
-def call_azure_chat(q: str) -> tuple[bool, str]:
-    prompt = build_advisor_prompt(q)
+    az = st.secrets.get("azure", {})
+    api_key = az.get("api_key")
+    endpoint = az.get("endpoint")
+    deployment = az.get("deployment")
+    api_version = az.get("api_version")
+
+    if not all([api_key, endpoint, deployment, api_version]):
+        return None, None, False, (
+            "Add [azure] api_key, endpoint, deployment, api_version in Streamlit secrets to enable the advisor."
+        )
+
+    try:
+        client = AzureOpenAI(
+            api_key=api_key,
+            azure_endpoint=endpoint,
+            api_version=api_version,
+        )
+        return client, deployment, True, ""
+    except Exception as e:
+        return None, None, False, f"Failed to initialize Azure OpenAI client: {e}"
+
+
+def ask_advisor(client, deployment, messages, temperature):
+    """
+    Call Azure OpenAI chat completion with safety and return string content or error text.
+    """
     try:
         resp = client.chat.completions.create(
             model=deployment,
-            temperature=temperature,
-            messages=[
-                {"role": "system", "content": "You are a helpful, cautious agronomy assistant."},
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=450,
+            messages=messages,
+            temperature=float(temperature),
         )
-        text = resp.choices[0].message.content.strip()
-        return True, text
+        return resp.choices[0].message.content.strip()
     except Exception as e:
-        return False, str(e)
+        return f"Azure call failed. See error details below.\n\n{e}"
 
-if question.strip():
-    if client is None:
-        st.info("Azure OpenAI not configured. Add `[azure] api_key, endpoint, deployment, api_version` in Streamlit secrets to enable the chatbot.")
-    else:
-        ok, answer = call_azure_chat(question.strip())
-        if ok:
-            st.success(answer)
-        else:
-            with st.expander("Azure call failed. See error details below."):
-                st.code(str(answer))
 
-# -------
-# Footer
-# -------
-st.markdown("---")
+# ---------- UI: Header ----------
 st.markdown(
     """
-<div class="footer" style="display:flex;align-items:center;gap:0.5rem;opacity:0.9;">
-  <span>Developed by <span class="name">Nikolay Georgiev</span></span>
-  <a href="https://www.linkedin.com/in/nikolaygeorgiev/" target="_blank" rel="noopener noreferrer" title="LinkedIn">
-    <img src="https://cdn.jsdelivr.net/gh/simple-icons/simple-icons/icons/linkedin.svg" width="18" height="18" style="vertical-align:-3px;opacity:0.9;" />
-  </a>
-</div>
-""",
-    unsafe_allow_html=True,
+    # Barley Advisor — Yield & Quality
+
+    Prototype model trained on Teagasc data. For demo only — **not** agronomic advice.
+    """,
+    help="Outputs are model-based estimates and should not be used as sole agronomic advice.",
 )
 
+# ---------- Left & right columns for inputs ----------
+left, right = st.columns(2)
+
+with left:
+    end_use = st.selectbox(
+        "End use",
+        END_USE_OPTIONS,
+        index=0,
+        help="Target use of the barley crop, used by the model to estimate protein and yield.",
+    )
+
+with right:
+    n_split_first_prop = st.number_input(
+        "N split — first application proportion",
+        min_value=0.0,
+        max_value=1.0,
+        step=0.05,
+        value=0.50,
+        help="Fraction of total N applied at the first timing (e.g., 0.50 = 50%).",
+    )
+
+with left:
+    n_rate_kg_ha = st.number_input(
+        "Nitrogen rate (kg/ha)",
+        min_value=0.0,
+        max_value=400.0,
+        step=5.0,
+        value=120.0,
+        help="Total nitrogen applied across the season.",
+    )
+
+with right:
+    final_n_choice = st.selectbox(
+        "Final N timing",
+        GS_FRIENDLY,
+        index=0,
+        help="Choose the last N timing; internally the model uses GS codes.",
+    )
+
+# Predict button
+pred_btn = st.button("Predict", type="primary")
+
+# ---------- Load model ----------
+model = load_model(MODEL_PATH)
+
+yield_pred = None
+protein_pred = None
+
+if pred_btn:
+    if model is None:
+        st.error("Model not loaded. Cannot predict.")
+    else:
+        X = make_feature_row(
+            end_use=end_use,
+            n_rate_kg_ha=n_rate_kg_ha,
+            n_split_first_prop=n_split_first_prop,
+            final_n_timing_label=final_n_choice,
+        )
+        try:
+            # Expecting a 2-value output: [yield_t_ha, protein_pct]
+            yhat = model.predict(X)
+            # Handle different shapes robustly
+            arr = np.array(yhat).reshape(-1)
+            if arr.size >= 2:
+                yield_pred = float(arr[0])
+                protein_pred = float(arr[1])
+            else:
+                st.error("Model returned an unexpected output shape.")
+        except Exception as e:
+            st.error(f"Prediction failed — check inputs or categories.\n\n{e}")
+
+# ---------- Show predictions ----------
+if (yield_pred is not None) and (protein_pred is not None):
+    m1, m2 = st.columns(2)
+    with m1:
+        st.success(f"**Predicted yield:** {yield_pred:.2f} t/ha")
+    with m2:
+        st.success(f"**Predicted grain protein:** {protein_pred:.2f} %")
+
+
+# ---------- Advisor (chat) row: Ask + Settings aligned ----------
+st.markdown("---")
+row_left, row_right = st.columns([3, 1])
+
+with row_left:
+    st.subheader("Ask the advisor")
+
+with row_right:
+    with st.expander("Advisor settings (optional)", expanded=False):
+        creativity = st.slider(
+            "Response style",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.20,
+            step=0.05,
+            help=(
+                "Controls how the advisor responds (this is **not** field temperature):\n"
+                "• Lower values = more conservative, consistent, and factual\n"
+                "• Higher values = more creative, exploratory, and varied"
+            ),
+        )
+
+# Chat input
+user_q = st.chat_input("Ask a question (e.g., 'What if I reduce N by 15%?')")
+
+if user_q:
+    # Prepare a short context for the advisor using current UI values/predictions
+    context_lines = [
+        f"End use: {end_use}",
+        f"Total N: {n_rate_kg_ha:.0f} kg/ha",
+        f"First application proportion (split): {n_split_first_prop:.2f}",
+        f"Final N timing: {final_n_choice} (code {GS_LABELS[final_n_choice]})",
+    ]
+    if (yield_pred is not None) and (protein_pred is not None):
+        context_lines.append(f"Model predicted yield: {yield_pred:.2f} t/ha")
+        context_lines.append(f"Model predicted protein: {protein_pred:.2f} %")
+    context = "\n".join(context_lines)
+
+    # System instruction keeps the advisor grounded and non-prescriptive.
+    system_prompt = (
+        "You are an agronomy assistant. Provide practical, cautious, and non-prescriptive "
+        "advice for barley management based on the user’s inputs and the model’s predicted "
+        "yield and protein. Always remind users to consult local agronomy advice and consider "
+        "trialing changes at small scale first."
+    )
+
+    client, deployment, ok, msg = get_azure_client()
+
+    if not ok:
+        st.warning(
+            "Azure OpenAI not configured. "
+            "Add `[azure] api_key, endpoint, deployment, api_version` in Streamlit secrets to enable the advisor."
+        )
+        with st.chat_message("assistant"):
+            st.write(
+                "If Azure were configured, I would answer here. Meanwhile, consider:\n"
+                "• For malting, reducing protein often means moderating N late in the season.\n"
+                "• For feed, a bit more N can lift yield, but watch lodging and split timing.\n"
+                "• Always adapt to local soils, rainfall, and lodging risk."
+            )
+    else:
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": f"Here are my inputs and model outputs:\n{context}\n\nMy question: {user_q}",
+            },
+        ]
+        with st.chat_message("user"):
+            st.write(user_q)
+        with st.chat_message("assistant"):
+            answer = ask_advisor(client, deployment, messages, temperature=creativity)
+            st.write(answer)
+
+
+# ---------- Footer credit ----------
+st.markdown("---")
+footer_col1, footer_col2 = st.columns([1, 3])
+with footer_col1:
+    st.caption("Version: demo")
+with footer_col2:
+    # LinkedIn after name, as requested
+    st.markdown(
+        """
+        <div style="text-align:right;">
+            Developed by <b>Nikolay Georgiev</b>
+            <a href="https://www.linkedin.com/in/nikolaygeorgiev/" target="_blank" rel="noopener">
+                <img alt="LinkedIn" src="https://cdn.jsdelivr.net/gh/simple-icons/simple-icons/icons/linkedin.svg" 
+                     style="height: 0.95em; vertical-align: text-bottom; margin-left: 6px;"/>
+            </a>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
