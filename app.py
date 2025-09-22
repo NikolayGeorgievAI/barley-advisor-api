@@ -223,16 +223,26 @@ if barley_price is None: barley_price = 190.0; notes.append("Barley manual fallb
 if urea_price is None: urea_price = 600.0; notes.append("Urea manual fallback: 600/t")
 
 st.markdown("### Gross margin (simple)")
-for n in notes: st.caption("• " + n)
+for n in notes: 
+    st.caption("• " + n)
 
 if yld is not None:
     revenue = yld * barley_price
     n_cost = n_rate * urea_cost_per_kgN(urea_price)
     gross = revenue - n_cost
+
+    # Default assume USD if we used FRED/TradingEconomics
+    currency = "USD"
+    if any("€" in note or "EUR" in note for note in notes):
+        currency = "€"
+    elif any("CHF" in note for note in notes):
+        currency = "CHF"
+
     c1, c2, c3 = st.columns(3)
-    with c1: st.metric("Revenue/ha", f"{revenue:,.0f}")
-    with c2: st.metric("N cost/ha", f"{n_cost:,.0f}")
-    with c3: st.metric("Gross margin/ha", f"{gross:,.0f}")
+    with c1: st.metric("Revenue/ha", f"{currency} {revenue:,.0f}")
+    with c2: st.metric("N cost/ha", f"{currency} {n_cost:,.0f}")
+    with c3: st.metric("Gross margin/ha", f"{currency} {gross:,.0f}")
+
 
 # ============== Advisor =================
 st.markdown("## Ask the advisor")
@@ -269,3 +279,4 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
