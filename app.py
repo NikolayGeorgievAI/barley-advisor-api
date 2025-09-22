@@ -1,330 +1,371 @@
-# app.py
+# app.py — Barley Advisor with live(ish) price feeds + gross margin
 import os
 import math
+import json
+import typing as t
+from dataclasses import dataclass
+
 import joblib
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 
-# ==============================
-# Page config & small CSS tweaks
-# ==============================
-st.set_page_config(
-    page_title="Barley Advisor — Yield & Quality",
-    page_icon="🌾",
-    layout="wide",
-)
-
-# Subtle style and a highlighted card for the advisor
+# ============== Page config & light CSS =================
+st.set_page_config(page_title="Barley Advisor — Yield & Quality", page_icon="🌾", layout="wide")
 st.markdown(
     """
     <style>
-    .advisor-card {
-        background: #f8f9fc;
-        border: 1px solid #eef0f6;
-        padding: 18px 18px 14px 18px;
-        border-radius: 14px;
-    }
-    .small-muted { color: #6c757d; font-size: 0.92rem; }
-    .footer a { text-decoration: none; }
-    .footer a:hover { text-decoration: underline; }
-    .linkedInIcon {
-        display:inline-block;
-        width:18px; height:18px;
-        margin-left:6px; position:relative; top:3px;
-    }
-    .metric-box {
-        padding:12px 14px; border:1px solid #eef0f6; border-radius:12px; background:#fff;
-    }
+      .advisor-card { background: #f8f9fc; border: 1px solid #eef0f6; padding: 18px; border-radius: 14px; }
+      .metric-box { padding:12px 14px; border:1px solid #eef0f6; border-radius:12px; background:#fff; }
+      .right-rail { border: 1px solid #eef0f6; border-radius: 12px; padding: 12px; background: #fff; }
+      .footer a { text-decoration: none; }
+      .footer img { width:18px; height:18px; margin-left: 6px; vertical-align: -3px; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# =======================
-# Load model and metadata
-# =======================
-@st.cache_resource(show_spinner=False)
-def load_model():
-    # Adjust if your model path differs
-    model_path = os.path.join("barley_model", "model.pkl")
-    mdl = joblib.load(model_path)
-    return mdl
-
-model = load_model()
-
-# The model was trained with these features (hidden defaults for some)
+# ============== Model loading =================
+MODEL_PATH = os.getenv("MODEL_PATH", "barley_model/model.pkl")
 EXPECTED_COLS = [
-    "source_doc",          # hidden default
-    "year",                # hidden default (we'll set a fixed value)
-    "site_id",             # hidden default
-    "end_use",
-    "n_rate_kg_ha",
-    "n_split_first_prop",
-    "final_n_timing_gs",
+    "source_doc", "year", "site_id", "end_use",
+    "n_rate_kg_ha", "n_split_first_prop", "final_n_timing_gs"
 ]
+HIDDEN = dict(source_doc="Focus2022", year=2020, site_id="S1")
 
-# Reasonable hidden defaults – adjust if your model expects different tokens
-HIDDEN_DEFAULTS = dict(
-    source_doc="Focus2022",
-    year=2020,
-    site_id="S1",
-)
+@st.cache_resource(show_spinner=False)
+def load_model(path: str):
+    return joblib.load(path)
 
-END_USE_OPTIONS = ["malting", "feed"]
-FINAL_N_OPTIONS = [
-    "Tillering (GS25)",
-    "Stem extension (GS31)",
-    "Flag leaf (GS39)",
-]
+MODEL = None
+MODEL_ERR = None
+try:
+    MODEL = load_model(MODEL_PATH)
+except Exception as e:
+    MODEL_ERR = str(e)
 
-# ==========================
-# Helper: make predictions
-# ==========================
-def predict_yield_quality(end_use: str, n_rate: float, n_split_prop: float, final_n_label: str):
-    # Map the final N timing label to a numeric GS code if your model expects that
-    # Here we parse the number inside parentheses, e.g. "Tillering (GS25)" -> 25
-    gs_val = 25
-    if "(" in final_n_label and "GS" in final_n_label:
-        try:
-            gs_val = int(final_n_label.split("GS")[1].split(")")[0])
-        except Exception:
-            pass
+# ============== Price fetchers (live-ish) =================
+@dataclass
+class PriceFetchSpec:
+    url: str
+    kind: str               # "csv" | "excel" | "json"
+    sheet: str | None = None
+    price_col: str | None = None
 
-    row = {
-        **HIDDEN_DEFAULTS,
-        "end_use": end_use,
-        "n_rate_kg_ha": float(n_rate),
-        "n_split_first_prop": float(n_split_prop),
-        "final_n_timing_gs": float(gs_val),
-    }
-    X = pd.DataFrame([row], columns=EXPECTED_COLS)
-
-    # Your pipeline likely returns a 2-vector: [yield_t_ha, protein_pct]
-    y_pred = model.predict(X)
-    yld, prot = float(y_pred[0][0]), float(y_pred[0][1])
-    return yld, prot
-
-# ====================================
-# Simple rule-based recommendation text
-# ====================================
-def rule_of_thumb_advice(end_use: str, n_rate: float, n_split_prop: float, final_n_label: str, yld: float, prot: float) -> str:
-    target_protein = 10.5 if end_use == "malting" else 11.5  # malting lower target; feed a bit higher is fine
-    delta_p = prot - target_protein
-
-    tips = []
-    if end_use == "malting":
-        if prot > target_protein + 0.3:
-            tips.append("Protein looks on the high side for malting. Consider **reducing total N** or **bringing more N earlier** (keep late N modest).")
-        elif prot < target_protein - 0.3:
-            tips.append("Protein may be a bit low. If quality allows, consider **slightly later N** or **a small top-up** to raise protein.")
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_csv_or_excel(spec: PriceFetchSpec) -> float | None:
+    """Generic CSV/XLSX fetch: returns the last non-NaN value from the specified column (or first numeric col)."""
+    try:
+        if spec.kind == "csv":
+            df = pd.read_csv(spec.url)
         else:
-            tips.append("Protein is close to a typical malting window. **Maintain a balanced split** and avoid late heavy N.")
-    else:  # feed
-        if prot < 8.5:
-            tips.append("Protein is quite low for feed; a **modest increase in total N** or **slightly later N** may improve grain protein.")
+            df = pd.read_excel(spec.url, sheet_name=spec.sheet) if spec.sheet else pd.read_excel(spec.url)
+        if spec.price_col and spec.price_col in df.columns:
+            s = pd.to_numeric(df[spec.price_col], errors="coerce").dropna()
         else:
-            tips.append("For feed barley this protein looks acceptable. Focus on **maximizing yield** with a balanced N plan.")
+            # find first numeric column
+            num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+            if not num_cols:
+                return None
+            s = pd.to_numeric(df[num_cols[-1]], errors="coerce").dropna()
+        return float(s.iloc[-1]) if not s.empty else None
+    except Exception:
+        return None
 
-    # Split guidance
-    split_pct = n_split_prop * 100
-    if split_pct < 35:
-        tips.append("Your first split is relatively small. Many programs use **40–50% at GS25** to support tillering.")
-    elif split_pct > 60:
-        tips.append("Your first split is quite large. Consider **40–50% at GS25** with the remainder later for flexibility.")
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_urea_from_tradingeconomics() -> float | None:
+    """
+    TradingEconomics API (public demo creds 'guest:guest').
+    Returns latest Urea price (USD per metric ton).
+      Docs: https://api.tradingeconomics.com/
+      Example: https://api.tradingeconomics.com/commodity/urea?c=guest:guest&format=json
+    """
+    try:
+        url = "https://api.tradingeconomics.com/commodity/urea?c=guest:guest&format=json"
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        # Usually returns a list; take last/first with a "Last" or "Price" field
+        if isinstance(data, list) and data:
+            rec = data[0]
+            val = rec.get("Last") or rec.get("Price") or rec.get("Value")
+            if val is not None:
+                return float(val)
+        return None
+    except Exception:
+        return None
 
-    # Lodging caution if late timing
-    if "GS39" in final_n_label:
-        tips.append("With **late N (GS39)**, watch lodging risk; ensure variety and canopy support it.")
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_barley_from_fred() -> float | None:
+    """
+    FRED: Global price of Barley (PBARLUSDM) — USD per metric ton, monthly.
+    Stable CSV: https://fred.stlouisfed.org/series/PBARLUSDM/downloaddata/PBARLUSDM.csv
+    """
+    try:
+        url = "https://fred.stlouisfed.org/series/PBARLUSDM/downloaddata/PBARLUSDM.csv"
+        df = pd.read_csv(url)
+        s = pd.to_numeric(df["PBARLUSDM"], errors="coerce").dropna()
+        return float(s.iloc[-1]) if not s.empty else None
+    except Exception:
+        return None
 
-    summary = f"- Predicted yield: **{yld:.2f} t/ha**\n- Predicted grain protein: **{prot:.2f}%**"
-    return "#### Quick take\n" + summary + "\n\n" + "#### Suggestions\n" + "\n".join([f"- {t}" for t in tips])
+def urea_cost_per_kgN(urea_price_per_tonne: float) -> float:
+    """Convert urea price (per tonne) to cost per kg of N (urea = 46% N)."""
+    if urea_price_per_tonne <= 0: 
+        return 0.0
+    return (urea_price_per_tonne / 1000.0) / 0.46
 
-# ==================================
-# Azure OpenAI (via Streamlit secret)
-# ==================================
+# ============== Azure OpenAI helper (optional) =================
 def get_azure_client():
     try:
-        az = st.secrets["azure"]
-        api_key = az.get("api_key", "")
-        endpoint = az.get("endpoint", "").rstrip("/")
-        deployment = az.get("deployment", "")
-        api_version = az.get("api_version", "")
-
-        if not (api_key and endpoint and deployment and api_version):
-            return None, "Missing one or more Azure secrets (api_key, endpoint, deployment, api_version)."
-
         from openai import AzureOpenAI
-        client = AzureOpenAI(
-            api_key=api_key,
-            api_version=api_version,
-            azure_endpoint=endpoint,
-        )
-        return (client, deployment), None
-    except Exception as e:
-        return None, f"Azure config error: {e}"
-
-def ask_azure_advisor(prompt: str, system_prompt: str, temperature: float):
-    pack, err = get_azure_client()
-    if err:
-        raise RuntimeError(err)
-    (client, deployment) = pack
-
+    except Exception:
+        return None, "openai SDK not installed"
+    cfg = st.secrets.get("azure", {})
+    req = ("api_key", "endpoint", "deployment", "api_version")
+    if not all(k in cfg and cfg[k] for k in req):
+        return None, "Azure OpenAI not configured"
     try:
-        resp = client.chat.completions.create(
-            model=deployment,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=max(0.0, min(1.0, float(temperature))),
+        client = AzureOpenAI(
+            api_key=cfg["api_key"],
+            api_version=cfg["api_version"],
+            azure_endpoint=cfg["endpoint"],
         )
-        return resp.choices[0].message.content.strip()
+        return client, None
     except Exception as e:
-        raise RuntimeError(f"Azure call failed: {e}")
+        return None, f"Azure init error: {e}"
 
-# ============
-# UI — Header
-# ============
+def ask_advisor(system_msg: str, user_msg: str, temperature: float) -> str:
+    client, err = get_azure_client()
+    if err or not client:
+        raise RuntimeError(err or "Azure not available")
+    resp = client.chat.completions.create(
+        model=st.secrets["azure"]["deployment"],
+        messages=[{"role": "system", "content": system_msg},
+                  {"role": "user", "content": user_msg}],
+        temperature=max(0.0, min(1.0, float(temperature))),
+        max_tokens=600,
+    )
+    return resp.choices[0].message.content.strip()
+
+# ============== UI: Title =================
 st.title("🌾 Barley Advisor — Yield & Quality")
 st.caption("Prototype model trained on Teagasc data. For demo only — not agronomic advice.")
 
-# ============
-# Inputs
-# ============
-st.header("Inputs")
+# ============== Inputs =================
+c1, c2 = st.columns(2)
+with c1:
+    n_rate = st.number_input("Nitrogen rate (kg/ha)", 0.0, 300.0, 120.0, 1.0)
+    n_split = st.number_input("N split — first application proportion", 0.0, 1.0, 0.50, 0.05,
+                              help="Fraction of total N applied at the first pass (e.g., 0.50 = 50%).")
+with c2:
+    end_use = st.selectbox("End use", ["feed", "malting"], index=0)
+    final_n_label = st.selectbox("Final N timing (GS)", 
+                                 ["Tillering (GS25)", "Stem elongation (GS31)", "Flag leaf (GS37)", "Emergence", "Sowing"], index=0)
 
-col1, col2 = st.columns(2)
+def gs_code(lbl: str) -> str:
+    s = lbl.lower()
+    if "gs25" in s or "tiller" in s: return "GS25"
+    if "gs31" in s or "stem" in s: return "GS31"
+    if "gs37" in s or "flag" in s: return "GS37"
+    if "emerg" in s: return "emergence"
+    if "sow" in s: return "sowing"
+    return "GS25"
 
-with col1:
-    n_rate = st.number_input("Nitrogen rate (kg/ha)", min_value=0.0, max_value=300.0, value=120.0, step=1.0)
-with col2:
-    end_use = st.selectbox("End use", END_USE_OPTIONS, index=END_USE_OPTIONS.index("feed"))
+def predict(end_use: str, n_rate: float, n_split: float, final_label: str) -> tuple[float, float]:
+    if MODEL_ERR: raise RuntimeError(MODEL_ERR)
+    row = {
+        "source_doc": HIDDEN["source_doc"],
+        "year": HIDDEN["year"],
+        "site_id": HIDDEN["site_id"],
+        "end_use": end_use,
+        "n_rate_kg_ha": float(n_rate),
+        "n_split_first_prop": float(n_split),
+        "final_n_timing_gs": gs_code(final_label),
+    }
+    X = pd.DataFrame([row], columns=EXPECTED_COLS)
+    y = MODEL.predict(X)  # [[yield, protein]] expected
+    return float(y[0][0]), float(y[0][1])
 
-with col1:
-    n_split = st.number_input("N split — first application proportion", min_value=0.0, max_value=1.0, value=0.50, step=0.05, help="Fraction of total N applied in the first split (e.g., 0.50 means 50% at GS25).")
-with col2:
-    final_n_label = st.selectbox("Final N timing", FINAL_N_OPTIONS, index=0)
-
-# Predict button
 pred_btn = st.button("Predict", type="primary")
-
-# Output placeholders
 yld, prot = None, None
 if pred_btn:
     try:
-        yld, prot = predict_yield_quality(end_use, n_rate, n_split, final_n_label)
-        m1, m2 = st.columns(2)
-        with m1:
-            st.markdown("<div class='metric-box'>", unsafe_allow_html=True)
-            st.subheader("Predicted yield")
-            st.markdown(f"<h3>{yld:.2f} t/ha</h3>", unsafe_allow_html=True)
-            st.markdown("</div>", unsafe_allow_html=True)
-        with m2:
-            st.markdown("<div class='metric-box'>", unsafe_allow_html=True)
-            st.subheader("Predicted grain protein")
-            st.markdown(f"<h3>{prot:.2f}%</h3>", unsafe_allow_html=True)
-            st.markdown("</div>", unsafe_allow_html=True)
+        yld, prot = predict(end_use, n_rate, n_split, final_n_label)
+        a, b = st.columns(2)
+        with a:
+            st.markdown(f"<div class='metric-box'><b>Predicted yield:</b> {yld:.2f} t/ha</div>", unsafe_allow_html=True)
+        with b:
+            st.markdown(f"<div class='metric-box'><b>Predicted grain protein:</b> {prot:.2f} %</div>", unsafe_allow_html=True)
     except Exception as e:
-        st.error(f"Prediction failed — check inputs. Details: {e}")
+        st.error(f"Prediction failed: {e}")
 
-# =========================
-# Big, inviting Advisor UI
-# =========================
-st.subheader("Ask the advisor")
+# ============== Sidebar: data source overrides =================
+with st.sidebar:
+    st.subheader("Live price sources (optional overrides)")
+    st.caption("App auto-uses TradingEconomics (Urea) & FRED (Barley). Override below if you prefer a CSV/XLSX URL.")
 
-# Right-aligned advisor settings
-right = st.container()
-with right:
-    with st.expander("Advisor settings (optional)", expanded=False):
-        # Rename with domain-safe language + clear tooltip
-        resp_style = st.slider(
-            "Response style",
-            min_value=0.0, max_value=1.0, value=0.20, step=0.05,
-            help="This controls how *creative vs. cautious* the AI writing is (AI parameter). "
-                 "Lower = more conservative/grounded, Higher = more exploratory. "
-                 "This is **not** crop temperature."
-        )
+    with st.expander("Override Urea source (CSV/XLSX)", expanded=False):
+        urea_url = st.text_input("Urea price URL")
+        urea_kind = st.radio("File type", ["csv", "excel"], horizontal=True, index=0, key="u_kind")
+        urea_sheet = st.text_input("Excel sheet (optional)")
+        urea_col = st.text_input("Price column (optional)")
 
-# Advisor card with large text area and bold button
-st.markdown("<div class='advisor-card'>", unsafe_allow_html=True)
+    with st.expander("Override Barley source (CSV/XLSX)", expanded=False):
+        barley_url = st.text_input("Barley price URL")
+        barley_kind = st.radio("File type ", ["csv", "excel"], horizontal=True, index=0, key="b_kind")
+        barley_sheet = st.text_input("Excel sheet (optional)")
+        barley_col = st.text_input("Price column (optional)")
 
-default_hint = "What if I reduce N by 15%?" if yld is None else f"Given the predictions ({yld:.2f} t/ha, {prot:.2f}%), what should I adjust?"
+    st.markdown("---")
+    st.caption("If overrides are empty or fail, the app uses TradingEconomics (Urea) and FRED (Barley).")
 
-user_q = st.text_area(
-    " ",
-    placeholder=f"Ask a question (e.g., '{default_hint}')",
-    height=90,
-    label_visibility="collapsed",
-)
-ask_btn = st.button("🚀 Ask Advisor", type="primary", use_container_width=True)
+# ============== Resolve prices (live -> override -> manual) =================
+st.markdown("### Gross margin (simple)")
 
-# System grounding for the model
-SYSTEM_PROMPT = (
-    "You are an agronomy assistant for spring barley. You respond succinctly, with clear bullet points and concrete, "
-    "practical advice. You base suggestions on the user's inputs and the predicted yield and protein. You do not provide "
-    "safety-critical advice. Always include a short summary and then 3–6 actionable bullets. If the user asks for something "
-    "outside barley N management, state what's out of scope and gently redirect."
-)
+# Manual fallback values (currency-agnostic numbers; choose € as display by default)
+barley_manual = st.number_input("Manual barley price (per tonne)", 0.0, 2000.0, 190.0, 1.0, key="b_manual")
+urea_manual   = st.number_input("Manual urea price (per tonne)", 0.0, 4000.0, 600.0, 1.0, key="u_manual")
+currency = st.selectbox("Currency display", ["€", "$", "£"], index=0)
 
-if ask_btn:
-    if not user_q.strip():
-        st.warning("Please type a question for the advisor.")
-    else:
-        # If we have predictions, include them; otherwise, still include the raw inputs
-        context_lines = [
-            f"End use: {end_use}",
-            f"N rate (kg/ha): {n_rate}",
-            f"First split proportion: {n_split} (≈ {n_split*100:.0f}%)",
-            f"Final N timing: {final_n_label}",
-        ]
-        if yld is not None and prot is not None:
-            context_lines.append(f"Predicted yield: {yld:.2f} t/ha")
-            context_lines.append(f"Predicted protein: {prot:.2f}%")
+# Try live fetches
+barley_price = None
+urea_price = None
+notes = []
 
-        base_context = " | ".join(context_lines)
-        full_prompt = (
-            f"Context: {base_context}\n\n"
-            f"User question: {user_q}\n\n"
-            "Please answer for a typical Irish/UK spring barley context, noting that local conditions and rules vary. "
-            "Keep it brief with a summary and 3–6 bullets."
-        )
+# 1) try overrides
+if barley_url:
+    v = fetch_csv_or_excel(PriceFetchSpec(barley_url, barley_kind, barley_sheet or None, barley_col or None))
+    if v: barley_price = float(v); notes.append(f"Barley price fetched from override URL: {barley_price:.2f}/t")
+if urea_url:
+    v = fetch_csv_or_excel(PriceFetchSpec(urea_url, urea_kind, urea_sheet or None, urea_col or None))
+    if v: urea_price = float(v); notes.append(f"Urea price fetched from override URL: {urea_price:.2f}/t")
 
-        # Attempt Azure call; if misconfigured, fall back to local rule-of-thumb
-        try:
-            answer = ask_azure_advisor(full_prompt, SYSTEM_PROMPT, resp_style)
-            st.markdown(answer)
-        except Exception as e:
-            st.warning(f"Azure advisor not available. Showing rule-of-thumb guidance instead. ({e})")
-            # Fallback uses our quick heuristic if we have predictions
-            if yld is None or prot is None:
-                # Get a temporary prediction so the advice has numbers
-                try:
-                    _y, _p = predict_yield_quality(end_use, n_rate, n_split, final_n_label)
-                except Exception:
-                    _y, _p = (math.nan, math.nan)
-                st.markdown(rule_of_thumb_advice(end_use, n_rate, n_split, final_n_label, _y, _p))
-            else:
-                st.markdown(rule_of_thumb_advice(end_use, n_rate, n_split, final_n_label, yld, prot))
+# 2) if missing, use defaults (live-ish)
+if barley_price is None:
+    v = fetch_barley_from_fred()
+    if v: barley_price = float(v); notes.append(f"Barley price from FRED (PBARLUSDM): {barley_price:.2f} USD/t")
+if urea_price is None:
+    v = fetch_urea_from_tradingeconomics()
+    if v: urea_price = float(v); notes.append(f"Urea price from TradingEconomics: {urea_price:.2f} USD/t")
 
-st.markdown("</div>", unsafe_allow_html=True)
+# 3) fallback to manual
+if barley_price is None:
+    barley_price = float(barley_manual); notes.append(f"Barley price using manual value: {barley_price:.2f}/t")
+if urea_price is None:
+    urea_price = float(urea_manual); notes.append(f"Urea price using manual value: {urea_price:.2f}/t")
 
-# =========
-# Footer
-# =========
+# If currency is €, but fetched in USD, you might add a quick FX knob (optional simple factor)
+fx_hint = 1.0
+if currency != "$":
+    with st.expander("Currency conversion (optional)", expanded=False):
+        st.caption("Fetched FRED/TE prices are in USD. Use a simple FX factor if displaying € or £.")
+        fx_hint = st.number_input("FX factor (USD → selected currency)", min_value=0.1, max_value=2.0, value=0.95, step=0.01,
+                                  help="E.g., USD→EUR ~0.94; USD→GBP ~0.78 (approx).")
+display_barley = barley_price * (fx_hint if currency != "$" else 1.0)
+display_urea   = urea_price   * (fx_hint if currency != "$" else 1.0)
+
+for n in notes:
+    st.caption("• " + n)
+
+# ============== Economics =================
+if yld is not None and prot is not None:
+    # Revenue
+    revenue = yld * display_barley
+    # N cost from urea: convert €/t → €/kg N, then multiply by kg N applied
+    n_cost = n_rate * urea_cost_per_kgN(display_urea)
+    gross = revenue - n_cost
+
+    g1, g2, g3 = st.columns(3)
+    with g1:
+        st.metric("Revenue/ha", f"{currency} {revenue:,.0f}", help=f"{yld:.2f} t/ha × {currency} {display_barley:,.0f}/t")
+    with g2:
+        st.metric("Nitrogen cost/ha", f"{currency} {n_cost:,.0f}",
+                  help=f"{n_rate:.0f} kg N/ha × {currency} {urea_cost_per_kgN(display_urea):.2f}/kg N")
+    with g3:
+        st.metric("Gross margin/ha", f"{currency} {gross:,.0f}")
+
+    st.caption("Simple partial margin: revenue from barley minus urea cost for N. "
+               "Does not include other variable/fixed costs.")
+
+# ============== Advisor (highlighted card) =================
+st.markdown("## Ask the advisor")
+rail, main = st.columns([0.4, 1.6], gap="large")
+
+with rail:
+    st.markdown("<div class='right-rail'>", unsafe_allow_html=True)
+    st.subheader("Advisor settings")
+    response_style = st.slider(
+        "Response style",
+        0.0, 1.0, 0.20, 0.05,
+        help="Controls the AI's writing style (not crop temperature).\n"
+             "Lower = conservative & consistent. Higher = exploratory & varied."
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+with main:
+    st.markdown("<div class='advisor-card'>", unsafe_allow_html=True)
+    default_hint = (
+        f"Given the predictions ({yld:.2f} t/ha, {prot:.2f}%), "
+        "what should I adjust?" if yld is not None else "What if I reduce N by 15%?"
+    )
+    user_q = st.text_area(" ", placeholder=default_hint, height=90, label_visibility="collapsed")
+    ask_btn = st.button("🚀 Ask Advisor", type="primary", use_container_width=True)
+
+    if ask_btn:
+        if not user_q.strip():
+            st.warning("Please type a question for the advisor.")
+        else:
+            # Small grounded system prompt
+            system_prompt = (
+                "You are a cautious agronomy assistant for spring barley. "
+                "Use the inputs, predictions, and prices to suggest practical, non-prescriptive actions. "
+                "Be concise, use bullet points, and mention caveats (soil N, lodging, regulations)."
+            )
+            context = {
+                "inputs": {
+                    "end_use": end_use,
+                    "n_rate_kg_ha": n_rate,
+                    "n_split_first_prop": n_split,
+                    "final_n_timing_gs": gs_code(final_n_label),
+                },
+                "prediction": {"yield_t_ha": yld, "protein_pct": prot},
+                "prices": {
+                    "barley_per_t": display_barley,
+                    "urea_per_t": display_urea,
+                    "currency": currency,
+                },
+            }
+            try:
+                answer = ask_advisor(system_prompt, f"Context:\n{json.dumps(context)}\n\nQuestion: {user_q}", response_style)
+                st.write(answer)
+            except Exception as e:
+                st.warning(f"Advisor unavailable. ({e})")
+                # Fallback: quick rules
+                tips = []
+                if end_use == "malting" and prot is not None:
+                    if prot > 11.0:
+                        tips.append("Protein above typical malting window (9.5–11%). Consider reducing late N or total N by ~10–20%.")
+                    elif prot < 9.5:
+                        tips.append("Protein below malting window; a small increase in N or slightly later split can help.")
+                if yld is not None and yld < 7 and n_rate < 150:
+                    tips.append("Yield modest; consider raising N (toward 150–180 kg/ha) if soil N is low and lodging risk is acceptable.")
+                st.markdown("**Fallback suggestions:**\n- " + "\n- ".join(tips) if tips else "No fallback suggestions available.")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# ============== Footer =================
 st.markdown("---")
-left, right = st.columns([1, 1])
-with left:
+f1, f2 = st.columns([1, 1])
+with f1:
     st.caption("Version: demo")
-with right:
+with f2:
     st.markdown(
         """
         <div class='footer' style='text-align:right;'>
-          Developed by <a href="https://www.linkedin.com/in/nikolaygeorgiev/" target="_blank">Nikolay Georgiev</a>
-          <a href="https://www.linkedin.com/in/nikolaygeorgiev/" target="_blank" class="linkedInIcon">
-            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="#0A66C2">
-              <path d="M19 0h-14c-2.761 0-5 2.239-5 5v14c0 2.762 2.239 5 5 5h14c2.762 0 5-2.238 5-5v-14c0-2.761-2.238-5-5-5zm-11 20h-3v-11h3v11zm-1.5-12.268c-.966 0-1.75-.79-1.75-1.764 0-.974.784-1.768 1.75-1.768s1.75.794 1.75 1.768c0 .974-.784 1.764-1.75 1.764zm13.5 12.268h-3v-5.604c0-1.337-.027-3.059-1.865-3.059-1.866 0-2.152 1.458-2.152 2.965v5.698h-3v-11h2.881v1.507h.041c.401-.761 1.379-1.563 2.84-1.563 3.04 0 3.602 2.003 3.602 4.609v6.447z"/>
-            </svg>
+          Developed by <b>Nikolay Georgiev</b>
+          <a href="https://www.linkedin.com/in/nikolaygeorgiev/" target="_blank" rel="noopener">
+            <img src="https://cdn.jsdelivr.net/gh/simple-icons/simple-icons/icons/linkedin.svg" alt="LinkedIn" />
           </a>
         </div>
         """,
