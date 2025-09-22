@@ -1,82 +1,149 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import joblib
 from pathlib import Path
-import numpy as np
+from typing import Dict, List, Any
 
 st.set_page_config(page_title="Barley Advisor", page_icon="🌾", layout="centered")
 st.title("🌾 Barley Advisor — Yield & Quality Predictor")
 st.caption("Prototype model trained on Teagasc dataset. For demo only — not agronomic advice.")
 
+# ---------------- Model loader ----------------
 @st.cache_resource
 def load_model():
     return joblib.load(Path("barley_model/model.pkl"))
 
 model = load_model()
 
-# Expected features from the trained pipeline
+# ---------------- Expected features ----------------
 EXPECTED = getattr(model, "feature_names_in_", None)
 if EXPECTED is None:
-    st.error("Model does not expose expected features. Please update pipeline or UI.")
+    # Try to find feature_names_in_ on final estimator inside a pipeline
+    EXPECTED = []
+    if hasattr(model, "named_steps"):
+        for step in model.named_steps.values():
+            cols = getattr(step, "feature_names_in_", None)
+            if cols is not None:
+                EXPECTED = list(cols)
+                break
+if not EXPECTED:
+    st.error("Model does not expose expected input feature names. Refit on a pandas DataFrame or provide the column list.")
     st.stop()
+EXPECTED = list(EXPECTED)
 
-# ---------- Input form ----------
+# ---------------- Introspect categories from encoders ----------------
+def discover_categorical_options(m) -> Dict[str, List[Any]]:
+    """
+    Walk a typical sklearn pipeline with a ColumnTransformer -> OneHotEncoder
+    and return {feature_name: [allowed_categories...]} for categoricals.
+    """
+    options: Dict[str, List[Any]] = {}
+
+    # Pull out a ColumnTransformer if present
+    transformers = []
+    if hasattr(m, "named_steps"):
+        # Try to find a ColumnTransformer in named_steps
+        for step in m.named_steps.values():
+            if hasattr(step, "transformers_"):
+                transformers = step.transformers_
+                break
+    elif hasattr(m, "transformers_"):
+        transformers = m.transformers_
+
+    # Each entry like ('cat', OneHotEncoder(...), [col1, col2, ...])
+    for name, transformer, cols in transformers:
+        # passthrough/ drop continue
+        if transformer in ("drop", "passthrough") or transformer is None:
+            continue
+
+        # If there is an inner pipeline, dive into its final step
+        if hasattr(transformer, "named_steps"):
+            inner = list(transformer.named_steps.values())[-1]
+        else:
+            inner = transformer
+
+        # OneHotEncoder stores categories_ aligned to its input columns
+        if inner.__class__.__name__ == "OneHotEncoder" and hasattr(inner, "categories_"):
+            cats = inner.categories_
+            # cols might be list or array of feature names for this encoder
+            if isinstance(cols, (list, tuple, np.ndarray)) and len(cols) == len(cats):
+                for feat, cat_list in zip(cols, cats):
+                    # convert numpy arrays to python lists
+                    options[str(feat)] = [c.item() if hasattr(c, "item") else c for c in list(cat_list)]
+
+    return options
+
+CATEGORICAL_OPTIONS = discover_categorical_options(model)
+
+# ---------------- Heuristics for numeric vs categorical ----------------
+NUMERIC_HINTS = ("_mm", "_c", "_kg", "_doy", "year", "prop", "gs", "srad", "rate")
+def looks_numeric(name: str) -> bool:
+    n = name.lower()
+    return any(h in n for h in NUMERIC_HINTS)
+
+# ---------------- Build the input form ----------------
 st.subheader("Inputs")
 
 user_vals = {}
 cols = st.columns(2)
 
-# Example mappings for categorical features (adapt these to your dataset)
-KNOWN_OPTIONS = {
-    "end_use": ["malting", "feed"],
-    "source": ["trial", "farm"],
-}
+def numeric_default_for(feat: str) -> float:
+    f = feat.lower()
+    if "year" in f: return 2020
+    if f.endswith("_kg") or "kg_ha" in f or "rate" in f: return 120.0
+    if f.endswith("_mm"): return 120.0
+    if f.endswith("_doy"): return 120.0
+    if f.endswith("_c") and "tmax" in f: return 18.0
+    if f.endswith("_c") and "tmin" in f: return 5.0
+    if "srad" in f: return 500.0
+    if f.endswith("prop"): return 0.5
+    if f.endswith("gs"): return 30.0
+    return 0.0
 
 for i, feat in enumerate(EXPECTED):
     col = cols[i % 2]
+    label = feat.replace("_", " ").title()
 
-    # numeric heuristic
-    if any(h in feat.lower() for h in ["_mm", "_c", "_kg", "_doy", "year", "prop", "gs", "srad"]):
-        default = 0.0
-        if "year" in feat: default = 2020
-        if "kg" in feat: default = 120
-        if "mm" in feat: default = 120
-        if "doy" in feat: default = 120
-        if "c" in feat: default = 15
-        if "prop" in feat: default = 0.5
-        val = col.number_input(feat.replace("_"," ").title(), value=float(default))
-        user_vals[feat] = val
-    else:
-        opts = KNOWN_OPTIONS.get(feat)
+    if feat in CATEGORICAL_OPTIONS:
+        # Use real categories learned during training
+        opts = CATEGORICAL_OPTIONS[feat]
+        # Streamlit requires non-empty options; if empty fallback to text
         if opts:
-            val = col.selectbox(feat.replace("_"," ").title(), opts)
+            user_vals[feat] = col.selectbox(label, options=opts, index=0)
         else:
-            val = col.text_input(feat.replace("_"," ").title())
-        user_vals[feat] = val
+            user_vals[feat] = col.text_input(label, "")
+    else:
+        # Fallback: numeric vs text guess
+        if looks_numeric(feat):
+            user_vals[feat] = col.number_input(label, value=float(numeric_default_for(feat)))
+        else:
+            user_vals[feat] = col.text_input(label, "")
 
-# ---------- Prediction ----------
+# ---------------- Predict ----------------
 if st.button("Predict"):
     try:
-        # build row in correct order
-        clean_row = []
-        for c in EXPECTED:
-            v = user_vals.get(c)
-            # flatten numpy / list
+        # Build a single row in the exact expected order
+        row = []
+        for feat in EXPECTED:
+            v = user_vals.get(feat)
+            # Flatten arrays/lists (defensive)
             if isinstance(v, (list, tuple, np.ndarray)):
-                v = v[0]
-            clean_row.append(v)
+                v = v[0] if len(v) else None
+            row.append(v)
 
-        X = pd.DataFrame([clean_row], columns=EXPECTED)
+        X = pd.DataFrame([row], columns=EXPECTED)
 
         y = model.predict(X)
-        y = np.array(y).flatten()
+        y = np.array(y).flatten()  # handle 1- or multi-target
 
         if len(y) == 1:
             st.success(f"Prediction: **{y[0]:.2f}**")
-        elif len(y) >= 2:
+        else:
+            # You can rename these to your actual target names
             st.success(f"🌾 Predicted yield: **{y[0]:.2f} t/ha**")
             st.success(f"🧬 Predicted grain protein: **{y[1]:.2f} %**")
 
     except Exception as e:
-        st.error("Prediction failed")
+        st.error("Prediction failed.")
         st.code(repr(e))
