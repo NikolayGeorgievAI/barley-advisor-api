@@ -396,20 +396,15 @@ if user_q:
 
 # ============= Footer =============
 st.markdown("---")
-footer_cols = st.columns([1,1,1,1,1,1,1,1,1,1,1,1,1,1])
-with footer_cols[-4]:
-    st.caption("Version: demo")
-with footer_cols[-1]:
+col1, col2 = st.columns([1, 2])
+with col1:
+    st.markdown("**Version:** demo")
+with col2:
     st.markdown(
-        """
-        <div class="footer-wrap">
-          <span>Developed by</span>
-          <a href="https://www.linkedin.com/in/nikolaygeorgiev/" target="_blank" rel="noopener">Nikolay Georgiev</a>
-          <img src="https://cdn.jsdelivr.net/gh/simple-icons/simple-icons/icons/linkedin.svg"
-               alt="LinkedIn" width="16" height="16" />
-        </div>
-        """,
+        "Developed by [Nikolay Georgiev](https://www.linkedin.com/in/nikolaygeorgiev/) "
+        "<img src='https://cdn-icons-png.flaticon.com/512/174/174857.png' width='15'>",
         unsafe_allow_html=True
     )
+
 
 
