@@ -10,6 +10,10 @@ import pandas as pd
 import joblib
 import streamlit as st
 
+# ================== Author / Branding ==================
+AUTHOR_NAME = "Nikolay Georgiev"
+LINKEDIN_URL = "https://www.linkedin.com/in/nikolaygeorgiev/"
+
 # ================== Page setup & styles ==================
 st.set_page_config(page_title="Barley Advisor — Yield & Quality Predictor", page_icon="🌾", layout="wide")
 
@@ -37,10 +41,16 @@ st.markdown(
 )
 
 st.markdown(
-    """
+    f"""
     <div class="top-banner">
       <div><strong>Barley Advisor</strong> — ML predictions + Azure Generative AI advisor</div>
-      <div class="pill">Demo version — N. Georgiev</div>
+      <div style="display:flex; align-items:center; gap:8px;">
+        <span class="pill">Demo version — N. Georgiev</span>
+        <a href="{LINKEDIN_URL}" target="_blank" rel="noopener"
+           style="font-size:12px; color:#2563eb; text-decoration:none;">
+           Developed by {AUTHOR_NAME} ↗
+        </a>
+      </div>
     </div>
     """,
     unsafe_allow_html=True
@@ -314,10 +324,12 @@ if user_msg:
 
 # ================== Footer ==================
 st.markdown(
-    """
+    f"""
     <div class="muted" style="margin-top:16px;">
       Data note: model training used public agronomy datasets from TEAGASC. Prototype for learning and discussion.
       Always validate with your own field data, local specs, and advisor guidance.
+      <br/>
+      Developed by <a href="{LINKEDIN_URL}" target="_blank" rel="noopener">{AUTHOR_NAME}</a>.
     </div>
     """,
     unsafe_allow_html=True
