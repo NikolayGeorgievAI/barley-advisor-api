@@ -26,6 +26,8 @@ st.markdown(
         font-size:13px; padding:4px 8px; border-radius:10px; background:#f5f7fb;
         border:1px solid #e7ebf5; margin-bottom:6px; white-space:nowrap; gap:8px;}
       .pill {display:inline-block; padding:2px 8px; border-radius:999px; background:#eef6ff; border:1px solid #dbeafe; font-size:12px;}
+      .pill-ok {background:#e8f7ee; border-color:#c8ecd6;}
+      .pill-warn {background:#f1f5ff; border-color:#dbeafe;}
 
       .kpi-grid {display:grid; grid-template-columns: repeat(4, minmax(210px, 1fr)); gap:10px;}
       .kpi {border:1px solid #eef1f6; border-radius:12px; padding:10px; background:white; box-shadow:0 1px 2px rgba(0,0,0,0.03);}
@@ -40,12 +42,51 @@ st.markdown(
     unsafe_allow_html=True
 )
 
+# ================== Secrets / Azure status ==================
+def get_secret_or_env(name: str, default: str = "") -> str:
+    """Prefer Streamlit secrets (flat or in [azure] section), else env vars."""
+    try:
+        if name in st.secrets:
+            v = str(st.secrets[name]).strip()
+            if v:
+                return v
+        if "azure" in st.secrets:
+            # Expect keys: endpoint, deployment, api_key, api_version
+            key_map = {
+                "AZURE_OPENAI_ENDPOINT": "endpoint",
+                "AZURE_OPENAI_DEPLOYMENT": "deployment",
+                "AZURE_OPENAI_API_KEY": "api_key",
+                "AZURE_OPENAI_API_VERSION": "api_version",
+            }
+            k = key_map.get(name)
+            if k and k in st.secrets["azure"]:
+                v = str(st.secrets["azure"][k]).strip()
+                if v:
+                    return v
+    except Exception:
+        pass
+    return os.getenv(name, default)
+
+AZURE_ENDPOINT    = get_secret_or_env("AZURE_OPENAI_ENDPOINT")
+AZURE_DEPLOYMENT  = get_secret_or_env("AZURE_OPENAI_DEPLOYMENT")
+AZURE_API_KEY     = get_secret_or_env("AZURE_OPENAI_API_KEY")
+AZURE_API_VERSION = get_secret_or_env("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
+AZURE_OK = bool(AZURE_ENDPOINT and AZURE_DEPLOYMENT and AZURE_API_KEY)
+
+# ================== Top banner ==================
+azure_badge = (
+    '<span class="pill pill-ok">Azure OpenAI connected</span>'
+    if AZURE_OK else
+    '<span class="pill pill-warn">Local mode (Azure optional)</span>'
+)
+
 st.markdown(
     f"""
     <div class="top-banner">
       <div><strong>Barley Advisor</strong> — ML predictions + Azure Generative AI advisor</div>
       <div style="display:flex; align-items:center; gap:8px;">
-        <span class="pill">Demo version — N. Georgiev</span>
+        {azure_badge}
+        <span class="pill">Demo — N. Georgiev</span>
         <a href="{LINKEDIN_URL}" target="_blank" rel="noopener"
            style="font-size:12px; color:#2563eb; text-decoration:none;">
            Developed by {AUTHOR_NAME} ↗
@@ -203,7 +244,7 @@ starch_low, starch_high = estimate_starch_dm(protein_dm, inputs.protector_on)
 st.markdown('<div class="kpi-grid">', unsafe_allow_html=True)
 st.markdown('<div class="kpi"><h4>Predicted yield</h4><div class="val good">{:.2f} t/ha</div></div>'.format(yield_t_ha), unsafe_allow_html=True)
 st.markdown(
-    '<div class="kpi"><h4>Predicted grain protein (DM)</h4>'
+    '<div class="kpi"><h4>Predicted protein (DM)</h4>'
     f'<div class="val">{protein_dm:.2f} %</div>'
     f'<div class="muted">Converted from as-is @ {inputs.moisture_pct:.1f}% moisture</div></div>',
     unsafe_allow_html=True
@@ -218,7 +259,7 @@ c1, c2 = st.columns((1.1, 1.0), gap="large")
 
 with c1:
     st.subheader("Estimated quality (proxy)")
-    st.caption("Protein range is ±0.5% abs around prediction (DM). Starch proxy inversely tracks protein; phosphate protector adds ≈+0.6% abs.")
+    st.caption("Protein range shown is ±0.5% abs around the model’s point estimate (DM). Starch inversely tracks protein; phosphate protector adds ≈+0.6 pp in this proxy.")
     q1, q2 = st.columns(2)
     with q1:
         st.markdown('<div class="card"><div class="muted">Estimated Protein (DM)</div><div class="val" style="font-weight:800; font-size:26px;">{:.1f}–{:.1f}%</div></div>'.format(prot_low, prot_high), unsafe_allow_html=True)
@@ -230,38 +271,23 @@ with c2:
     margin_per_ha, margin_total, breakdown = gross_margin_simple(inputs, yield_t_ha)
     st.dataframe(breakdown, hide_index=True, use_container_width=True)
     st.markdown(
-        f'<div class="card" style="margin-top:10px;"><div class="muted">Summary</div>'
+        f'<div class="card" style="margin-top:10px;"><div class="muted">Summary (per ha / field)</div>'
         f'<div style="font-size:22px; font-weight:800;">Per ha: {symbol(inputs.currency)}{margin_per_ha:,.0f} &nbsp;|&nbsp; Field: {symbol(inputs.currency)}{margin_total:,.0f}</div></div>',
         unsafe_allow_html=True
     )
 
-# ================== Azure GenAI (no diagnostics UI) ==================
-st.subheader("Ask the Generative AI advisor")
-st.caption("Powered by Azure OpenAI when configured. Try: “What if I reduce N by 15%?”")
-
-def get_secret_or_env(name: str, default: str = "") -> str:
-    # Prefer Streamlit secrets (flat or [azure] nested), then env vars
-    try:
-        if name in st.secrets:  # flat
-            v = str(st.secrets[name]).strip()
-            if v: return v
-        if "azure" in st.secrets and name.lower().replace("azure_openai_", "").replace("api_", "api_") in st.secrets["azure"]:
-            v = str(st.secrets["azure"][name.lower().replace("azure_openai_", "")]).strip()
-            if v: return v
-    except Exception:
-        pass
-    return os.getenv(name, default)
-
-AZURE_ENDPOINT   = get_secret_or_env("AZURE_OPENAI_ENDPOINT")
-AZURE_DEPLOYMENT = get_secret_or_env("AZURE_OPENAI_DEPLOYMENT")
-AZURE_API_KEY    = get_secret_or_env("AZURE_OPENAI_API_KEY")
-AZURE_API_VERSION= get_secret_or_env("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
+# ================== Azure GenAI (advisor) ==================
+st.subheader("Generative AI advisor (optional)")
+if AZURE_OK:
+    st.caption('✅ Azure OpenAI connected. Try: “What if I reduce N by 15%?”')
+else:
+    st.caption('🟦 Local mode: predictions run without Azure OpenAI. Enable Azure secrets to use the advisor.')
 
 def call_azure_genai(prompt: str, context: dict) -> str:
-    if not (AZURE_ENDPOINT and AZURE_DEPLOYMENT and AZURE_API_KEY):
-        return ("Azure advisor not configured. Heuristic: lowering N ≈15% usually reduces protein (DM) by ≈0.1–0.3 percentage points; "
-                "yield response varies by season. Urea savings can improve margin when grain prices are soft. "
-                "Protector adds cost but may nudge starch DM upward (≈+0.6 pp here).")
+    if not AZURE_OK:
+        return ("Azure advisor is not connected. Heuristic: lowering N by ~15% typically reduces protein (DM) by ~0.1–0.3 pp; "
+                "yield response is season-dependent. Urea savings can improve margin when grain prices are soft. "
+                "Protector adds cost but may nudge starch DM upward (~+0.6 pp here).")
     try:
         import requests
         url = f"{AZURE_ENDPOINT.rstrip('/')}/openai/deployments/{AZURE_DEPLOYMENT}/chat/completions?api-version={AZURE_API_VERSION}"
@@ -287,19 +313,20 @@ def call_azure_genai(prompt: str, context: dict) -> str:
         return f"(Azure call failed; local fallback) {e}"
 
 def sanitize_md(s: str) -> str:
-    # Prevent accidental strikethrough if any tildes appear
-    return s.replace("~", r"\~")
+    return s.replace("~", r"\\~")
 
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
 for role, content in st.session_state.chat_history:
-    with st.chat_message(role): st.markdown(content)
+    with st.chat_message(role):
+        st.markdown(content)
 
 user_msg = st.chat_input("Ask a question (e.g., “What if I reduce N by 15%?”)")
 if user_msg:
     st.session_state.chat_history.append(("user", user_msg))
-    with st.chat_message("user"): st.markdown(user_msg)
+    with st.chat_message("user"):
+        st.markdown(user_msg)
 
     context = {
         "yield_t_ha": round(yield_t_ha, 2),
@@ -320,7 +347,8 @@ if user_msg:
     reply = call_azure_genai(user_msg, context)
     safe_reply = sanitize_md(reply)
     st.session_state.chat_history.append(("assistant", safe_reply))
-    with st.chat_message("assistant"): st.markdown(safe_reply)
+    with st.chat_message("assistant"):
+        st.markdown(safe_reply)
 
 # ================== Footer ==================
 st.markdown(
@@ -328,6 +356,8 @@ st.markdown(
     <div class="muted" style="margin-top:16px;">
       Data note: model training used public agronomy datasets from TEAGASC. Prototype for learning and discussion.
       Always validate with your own field data, local specs, and advisor guidance.
+      <br/>
+      Built with Python + Streamlit. Optional Azure OpenAI integration for what-if guidance.
       <br/>
       Developed by <a href="{LINKEDIN_URL}" target="_blank" rel="noopener">{AUTHOR_NAME}</a>.
     </div>
