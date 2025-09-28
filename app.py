@@ -51,7 +51,6 @@ def get_secret_or_env(name: str, default: str = "") -> str:
             if v:
                 return v
         if "azure" in st.secrets:
-            # Expect keys: endpoint, deployment, api_key, api_version
             key_map = {
                 "AZURE_OPENAI_ENDPOINT": "endpoint",
                 "AZURE_OPENAI_DEPLOYMENT": "deployment",
@@ -277,7 +276,7 @@ with c2:
     )
 
 # ================== Azure GenAI (advisor) ==================
-st.subheader("Generative AI advisor (optional)")
+st.subheader("Generative AI advisor")
 if AZURE_OK:
     st.caption('✅ Azure OpenAI connected. Try: “What if I reduce N by 15%?”')
 else:
