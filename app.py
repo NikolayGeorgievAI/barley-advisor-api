@@ -371,4 +371,113 @@ with tab_econ:
         <p><b>Inputs</b>: N={inputs.n_rate} kg/ha, P={inputs.p_rate} kg/ha, Moisture={inputs.moisture_pct}%</p>
         <p><b>Results</b>: Yield={yield_t_ha:.2f} t/ha, Protein (DM)={protein_dm:.2f}%,
            Margin/ha={symbol(inputs.currency)}{margin_per_ha:,.0f}</p>
-        <p><b>Economics (compact)</b>: Grain price={price_per_t} €/t, N price={n_price_
+        <p><b>Economics (compact)</b>: Grain price={price_per_t} €/t, N price={n_price_per_kg} €/kg N,
+           Emissions={em_kg:.0f} kg CO₂e/ha</p>
+        <hr><p>© {AUTHOR_NAME} — <a href="{LINKEDIN_URL}">LinkedIn</a></p>
+        </body></html>
+        """
+        st.download_button("Save report", report.encode("utf-8"), file_name="barley_report_v2.html", mime="text/html")
+
+# ---------- Model Card ----------
+with tab_model:
+    st.subheader("Model Card (Transparency)")
+    st.markdown(f"""
+**Data:** TEAGASC barley agronomy trials (public).  
+**Features:** N rate, P rate; protein converted to DM using user moisture.  
+**Targets:** Yield (t/ha), Protein (% as-is → shown as DM).  
+**Training:** Classical ML; fallback demo formula when model file missing.  
+**Version:** {APP_VERSION}  
+**Intended use:** Scenario comparison & education; not a substitute for local agronomy.  
+**Known limitations:** Simplified; not calibrated to all regions/cultivars/soils; weather not modeled.  
+**Safety:** Economic outputs depend on prices entered; interpret with care.
+""")
+
+# ================== Azure GenAI (advisor) — kept from v1 ==================
+st_divider()
+st.subheader("Generative AI advisor")
+if AZURE_OK:
+    st.caption('✅ Azure OpenAI connected. Try: “What if I reduce N by 15%?”')
+else:
+    st.caption('🟦 Local mode: predictions run without Azure OpenAI. Enable Azure secrets to use the advisor.')
+
+def call_azure_genai(prompt: str, context: dict) -> str:
+    if not AZURE_OK:
+        return ("Azure advisor is not connected. Heuristic: lowering N by ~15% typically reduces protein (DM) by ~0.1–0.3 pp; "
+                "yield response is season-dependent. Urea savings can improve margin when grain prices are soft. "
+                "Protector adds cost but may nudge starch DM upward (~+0.6 pp here).")
+    try:
+        import requests
+        url = f"{AZURE_ENDPOINT.rstrip('/')}/openai/deployments/{AZURE_DEPLOYMENT}/chat/completions?api-version={AZURE_API_VERSION}"
+        headers = {"api-key": AZURE_API_KEY, "Content-Type": "application/json"}
+        sys_prompt = (
+            "You are an agronomy advisor. Be concise and practical. "
+            "Use the provided context (yield, protein DM, starch DM band, prices, costs) to reason about margin trade-offs. "
+            "Explain DM vs as-is clearly if asked."
+        )
+        payload = {
+            "messages": [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": f"Context: {context}"},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.3,
+            "top_p": 0.95,
+        }
+        r = requests.post(url, headers=headers, json=payload, timeout=20)
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        return f"(Azure call failed; local fallback) {e}"
+
+def sanitize_md(s: str) -> str:
+    return s.replace("~", r"\\~")
+
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
+for role, content in st.session_state.chat_history:
+    with st.chat_message(role):
+        st.markdown(content)
+
+user_msg = st.chat_input("Ask a question (e.g., “What if I reduce N by 15%?”)")
+if user_msg:
+    st.session_state.chat_history.append(("user", user_msg))
+    with st.chat_message("user"):
+        st.markdown(user_msg)
+
+    context = {
+        "yield_t_ha": round(yield_t_ha, 2),
+        "protein_dm_pct": round(protein_dm, 2),
+        "starch_dm_band": (round(starch_low, 1), round(starch_high, 1)),
+        "currency": inputs.currency,
+        "barley_type": inputs.barley_type,
+        "barley_price_per_t": inputs.barley_price,
+        "urea_price_per_t": inputs.urea_price,
+        "phosphate_price_per_t": inputs.phosphate_price,
+        "inhibitor_on": inputs.inhibitor_on,
+        "protector_on": inputs.protector_on,
+        "moisture_pct": inputs.moisture_pct,
+        "n_rate": inputs.n_rate,
+        "p_rate": inputs.p_rate,
+        "margin_per_ha": round(margin_per_ha, 0),
+    }
+    reply = call_azure_genai(user_msg, context)
+    safe_reply = sanitize_md(reply)
+    st.session_state.chat_history.append(("assistant", safe_reply))
+    with st.chat_message("assistant"):
+        st.markdown(safe_reply)
+
+# ================== Footer ==================
+st.markdown(
+    f"""
+    <div class="muted" style="margin-top:16px;">
+      Data note: model training used public agronomy datasets from TEAGASC. Prototype for learning and discussion.
+      Always validate with your own field data, local specs, and advisor guidance.
+      <br/>
+      Built with Python + Streamlit. Optional Azure OpenAI integration for what-if guidance.
+      <br/>
+      Developed by <a href="{LINKEDIN_URL}" target="_blank" rel="noopener">{AUTHOR_NAME}</a>. {APP_VERSION}
+    </div>
+    """,
+    unsafe_allow_html=True
+)
